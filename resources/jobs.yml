@@ -1,0 +1,66 @@
+# =============================================================================
+# Shared, REUSABLE Lakebase ops jobs — created ONCE, run per-instance with params.
+# =============================================================================
+# These are NOT per-instance. One copy of each job serves every Lakebase instance;
+# you pass the target instance's values at RUN time via job parameters, e.g.:
+#
+#   databricks bundle run setup_dataapi_role -t dev \
+#     --params project_id=sh-lakebase-is-proj-c,database=sh_is_lakebase,secret_scope=sh-lakebase
+#
+# The notebooks read these via dbutils.widgets.get(...). Job-level `parameters`
+# below define the names + defaults; --params overrides them at run time.
+#
+# This replaces the old per-instance proj_<x>_* jobs (which multiplied 3x per
+# instance and cluttered the workspace). Instance files (lakebase_proj_<x>.yml)
+# now declare ONLY the project (+ catalog if used) — not jobs.
+# -----------------------------------------------------------------------------
+
+resources:
+  jobs:
+    setup_dataapi_role:
+      name: "[SH Lakebase] Setup Data API role (grant SP)"
+      # No defaults on identity params — the notebook fails fast if any are blank,
+      # so a misconfigured run can never grant against the wrong instance/database.
+      parameters:
+        - name: project_id
+          default: ""
+        - name: database
+          default: ""
+        - name: secret_scope
+          default: ""
+      tasks:
+        - task_key: setup_role
+          notebook_task:
+            notebook_path: ../src/setup_dataapi_role.py
+
+    setup_synced_table_grants:
+      name: "[SH Lakebase] Grant read on synced-table schemas"
+      # project_id/database: no default (fail fast). schemas: real default. grant_to: blank=current user.
+      parameters:
+        - name: project_id
+          default: ""
+        - name: database
+          default: ""
+        - name: schemas
+          default: epic_census,pdax_quality
+        - name: grant_to
+          default: ""
+      tasks:
+        - task_key: grant_read
+          notebook_task:
+            notebook_path: ../src/setup_synced_table_grants.py
+
+    dataapi_examples:
+      name: "[SH Lakebase] Data API examples (PostgREST over HTTP)"
+      # No default on identity params — notebook fails fast if blank.
+      parameters:
+        - name: project_id
+          default: ""
+        - name: database
+          default: ""
+        - name: secret_scope
+          default: ""
+      tasks:
+        - task_key: dataapi
+          notebook_task:
+            notebook_path: ../src/dataapi_examples.py

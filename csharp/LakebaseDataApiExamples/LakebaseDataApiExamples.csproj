@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>LakebaseDataApiExamples</RootNamespace>
+    <AssemblyName>LakebaseDataApiExamples</AssemblyName>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+
+  <!--
+    No external NuGet packages: everything uses the BCL (System.Net.Http +
+    System.Text.Json). This is the C# port of ../../src/dataapi_examples.py.
+  -->
+
+</Project>

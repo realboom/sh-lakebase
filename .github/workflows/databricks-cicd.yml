@@ -1,0 +1,168 @@
+name: Databricks DABs CI/CD
+
+# Model:
+#   - Pull request  -> validate dev (cheap, safe; no deploy). Developers deploy `dev`
+#     locally as themselves (`databricks bundle deploy -t dev`). CI does not deploy dev
+#     (mode:development is per-user; CI's SP has no /Workspace/Users/<sp> home).
+#   - Merge to main -> deploy `prod` (CI authenticates AS the prod deploy SP).
+#   - Manual dispatch -> onboard / update a Lakebase instance, with a CONDITIONAL
+#     "create new provisioned instance" step (see the onboard-lakebase job).
+#
+# Auth: OAuth M2M (service principal). Per-environment GitHub Environments hold creds:
+#   vars:    DATABRICKS_HOST
+#   secrets: DATABRICKS_CLIENT_ID, DATABRICKS_CLIENT_SECRET
+# Create the SPs with scripts/bootstrap_identity.sh and put their client id/secret here.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  # Manual trigger for onboarding a Lakebase instance OR just updating an existing one.
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "DABs target"
+        type: choice
+        options: [dev, prod]
+        default: dev
+      create_new_instance:
+        description: "Create a NEW provisioned instance? (leave UNCHECKED to only deploy changes to an existing autoscale instance)"
+        type: boolean
+        default: false
+      resource_key:
+        description: "DABs postgres_projects KEY for the new instance (underscores, e.g. sh_lakebase_proj_b) — must already exist in a committed resources/lakebase_proj_*.yml"
+        type: string
+        required: false
+      instance_name:
+        description: "New instance SLUG / project_id (hyphens, e.g. sh-lakebase-is-proj-b) — must be a fresh, never-used slug"
+        type: string
+        required: false
+      capacity:
+        description: "Provisioned SKU for the create step (transient)"
+        type: choice
+        options: [CU_1, CU_2]
+        default: CU_1
+      database:
+        description: "Postgres database name — must match the instance's catalog `postgres_database` (e.g. sh_is_lakebase). Used by the Data API grant step."
+        type: string
+        default: sh_is_lakebase
+      run_data_api_grants:
+        description: "Run Data API role grants? (check ONLY after you have manually clicked 'Enable Data API' on the instance in the UI — that step creates the authenticator role the grants need)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  # ---- PR safety gate: validate dev only ----
+  validate-dev:
+    if: github.event_name == 'pull_request'
+    runs-on: self-hosted
+    environment: dev
+    env:
+      DATABRICKS_HOST: ${{ vars.DATABRICKS_HOST }}
+      DATABRICKS_CLIENT_ID: ${{ secrets.DATABRICKS_CLIENT_ID }}
+      DATABRICKS_CLIENT_SECRET: ${{ secrets.DATABRICKS_CLIENT_SECRET }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: databricks/setup-cli@main
+      - run: databricks bundle validate -t dev
+
+  # ---- Merge to main: auto-deploy prod (steady state; NO create/bind) ----
+  # DISABLED 2026-07-25: no live prod workspace yet (the FEVM prod host is down and
+  # the prod GitHub env creds are stale), so this fired red on every merge. Re-enable
+  # once the `prod` GitHub environment points at a stable workspace with fresh SP creds.
+  # deploy-prod:
+  #   if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+  #   runs-on: self-hosted
+  #   environment: prod               # add required reviewers on this env to gate prod
+  #   concurrency: deploy-prod
+  #   env:
+  #     DATABRICKS_HOST: ${{ vars.DATABRICKS_HOST }}
+  #     DATABRICKS_CLIENT_ID: ${{ secrets.DATABRICKS_CLIENT_ID }}
+  #     DATABRICKS_CLIENT_SECRET: ${{ secrets.DATABRICKS_CLIENT_SECRET }}
+  #   steps:
+  #     - uses: actions/checkout@v5
+  #     - uses: databricks/setup-cli@main
+  #     - name: Validate prod
+  #       run: databricks bundle validate -t prod
+  #     - name: Deploy prod
+  #       run: databricks bundle deploy -t prod
+
+  # ---- Manual: onboard a NEW instance OR update an existing one ----
+  # The create/bind/patch steps are GATED on inputs.create_new_instance.
+  # Uncheck the box -> only `bundle deploy` runs (the update-existing path).
+  onboard-lakebase:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: self-hosted
+    environment: ${{ inputs.target }}   # binds creds + (for prod) approval gate to the chosen target
+    concurrency: onboard-${{ inputs.target }}
+    env:
+      DATABRICKS_HOST: ${{ vars.DATABRICKS_HOST }}
+      DATABRICKS_CLIENT_ID: ${{ secrets.DATABRICKS_CLIENT_ID }}
+      DATABRICKS_CLIENT_SECRET: ${{ secrets.DATABRICKS_CLIENT_SECRET }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: databricks/setup-cli@main
+
+      # --- ONE-TIME steps: only when creating a brand-new instance ---
+      - name: (new) Create provisioned instance
+        if: ${{ inputs.create_new_instance }}
+        run: |
+          databricks database create-database-instance "${{ inputs.instance_name }}" \
+            --capacity "${{ inputs.capacity }}"
+
+      - name: (new) Bind autoscaling project into DABs state
+        if: ${{ inputs.create_new_instance }}
+        run: |
+          databricks bundle deployment bind "${{ inputs.resource_key }}" \
+            "projects/${{ inputs.instance_name }}" -t "${{ inputs.target }}" --auto-approve
+
+      # --- ALWAYS runs: this is the update-existing path (and finishes a new create) ---
+      - name: Validate
+        run: databricks bundle validate -t "${{ inputs.target }}"
+      - name: Deploy
+        run: databricks bundle deploy -t "${{ inputs.target }}"
+
+      # --- ONE-TIME: set the 0.5->2 CU window on the new instance's primary endpoint ---
+      # DABs cannot set this on an auto-created primary (silent no-op), so PATCH directly.
+      # Mint the OAuth token straight from the SP creds via /oidc/v1/token — do NOT use
+      # `databricks auth token`, which needs the OS keyring (unreachable on a headless
+      # self-hosted runner: "OS keyring unreachable: exit status 36" -> empty token -> 401).
+      - name: (new) Set autoscaling window 0.5 -> 2
+        if: ${{ inputs.create_new_instance }}
+        run: |
+          TOKEN=$(curl -s -X POST "$DATABRICKS_HOST/oidc/v1/token" \
+            -u "$DATABRICKS_CLIENT_ID:$DATABRICKS_CLIENT_SECRET" \
+            -d "grant_type=client_credentials&scope=all-apis" | jq -r .access_token)
+          if [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then echo "failed to mint OAuth token"; exit 1; fi
+          curl -s -X PATCH -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+            "$DATABRICKS_HOST/api/2.0/postgres/projects/${{ inputs.instance_name }}/branches/production/endpoints/primary?update_mask=spec.autoscaling_limit_min_cu,spec.autoscaling_limit_max_cu" \
+            -d '{"spec":{"autoscaling_limit_min_cu":0.5,"autoscaling_limit_max_cu":2}}' \
+            -w "\n[HTTP %{http_code}]\n"
+
+      # --- Grant the Data API SP its Postgres role ---
+      # Gated on run_data_api_grants (NOT create) because it has a MANUAL prerequisite:
+      # you must click "Enable Data API" on the instance in the UI first — that creates
+      # the `authenticator` role the grant depends on. There is no API to enable it.
+      # Job key is derived from resource_key: sh_lakebase_proj_<x> -> proj_<x>_setup_dataapi_role
+      # Runs the SHARED, reusable setup_dataapi_role job with the instance's params.
+      # (Jobs are created once in resources/jobs.yml; instance_name is passed at run time.)
+      - name: Grant Data API role
+        if: ${{ inputs.run_data_api_grants }}
+        run: |
+          INST="${{ inputs.instance_name }}"
+          if [ -z "$INST" ]; then
+            echo "::error::instance_name is required when run_data_api_grants is checked (e.g. sh-lakebase-is-proj-b)"
+            exit 1
+          fi
+          DB="${{ inputs.database }}"
+          if [ -z "$DB" ]; then
+            echo "::error::database is required when run_data_api_grants is checked (e.g. sh_is_lakebase)"
+            exit 1
+          fi
+          echo "Granting Data API role for project_id=$INST database=$DB"
+          databricks bundle run setup_dataapi_role -t "${{ inputs.target }}" \
+            --params "project_id=$INST,database=$DB,secret_scope=sh-lakebase"
