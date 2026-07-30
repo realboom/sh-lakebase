@@ -155,10 +155,10 @@ resources:
       tasks:
         - task_key: billing_usage
           pipeline_task:
-            pipeline_id: ${resources.postgres_synced_tables.general_epic_census_billing_usage.data_synchronization_status.pipeline_id}
+            pipeline_id: ${resources.postgres_synced_tables.general_epic_census_billing_usage.status.pipeline_id}
         - task_key: node_types
           pipeline_task:
-            pipeline_id: ${resources.postgres_synced_tables.general_epic_census_node_types.data_synchronization_status.pipeline_id}
+            pipeline_id: ${resources.postgres_synced_tables.general_epic_census_node_types.status.pipeline_id}
 
     refresh_healow_snapshots:
       name: "[SH Lakebase] Refresh healow snapshots (${var.environment})"
@@ -170,10 +170,10 @@ resources:
       tasks:
         - task_key: query_history
           pipeline_task:
-            pipeline_id: ${resources.postgres_synced_tables.general_healow_query_history.data_synchronization_status.pipeline_id}
+            pipeline_id: ${resources.postgres_synced_tables.general_healow_query_history.status.pipeline_id}
         - task_key: audit
           pipeline_task:
-            pipeline_id: ${resources.postgres_synced_tables.general_healow_audit.data_synchronization_status.pipeline_id}
+            pipeline_id: ${resources.postgres_synced_tables.general_healow_audit.status.pipeline_id}
 
   # NOTE: ops jobs (setup_dataapi_role, setup_synced_table_grants, dataapi_examples)
   # are shared/reusable in resources/jobs.yml and run per-instance with --params,
