@@ -61,13 +61,10 @@ resources:
           value: dabs
         - key: value_stream
           value: risk
-        # Data API wiring (used later by setup_dataapi_role, read from the resolved
-        # bundle JSON — not from the deployed instance, since custom_tags are a no-op
-        # on the Lakebase project through CLI v1.5.0). The secret SCOPE is derived per
-        # env as kv-sh-ent-dpa-${environment}; this is the vault KEY NAME inside that
-        # scope holding THIS value stream's SP client id.
-        - key: dataapi_client_id_key
-          value: kv-sp-risk-client-id
+        # Data API wiring is DERIVED from value_stream — developer provides nothing extra.
+        # Secret scope  = kv-sh-ent-dpa-${environment}   (same for every stream, per env)
+        # Client-id key = sp-${value_stream}-dbrk-client-id  (vault key inside that scope)
+        # e.g. risk -> scope kv-sh-ent-dpa-dev, key sp-risk-dbrk-client-id.
 
   # ---- UC catalogs: one per Postgres database (exposes public schema to UC) ----
   # Each entry registers a Postgres database into Unity Catalog as a catalog.

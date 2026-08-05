@@ -39,10 +39,9 @@ resources:
           value: dabs
         - key: value_stream
           value: member
-        # Data API wiring: scope derived per env as kv-sh-ent-dpa-${environment};
-        # this is the vault KEY NAME inside that scope for THIS stream's SP client id.
-        - key: dataapi_client_id_key
-          value: kv-sp-member-client-id
+        # Data API wiring is DERIVED from value_stream — developer provides nothing extra.
+        # Secret scope  = kv-sh-ent-dpa-${environment}   (same for every stream, per env)
+        # Client-id key = sp-${value_stream}-dbrk-client-id  (vault key inside that scope)
 
   # ---- UC catalog: register the default databricks_postgres DB (stream-scoped id) ----
   postgres_catalogs:

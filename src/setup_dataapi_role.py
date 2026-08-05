@@ -24,15 +24,19 @@ from databricks.sdk import WorkspaceClient
 dbutils.widgets.text("project_id", "")
 dbutils.widgets.text("database", "")
 dbutils.widgets.text("secret_scope", "")
+dbutils.widgets.text("client_id_key", "")   # vault key name holding the SP client id
 PROJECT = dbutils.widgets.get("project_id").strip()
 DB      = dbutils.widgets.get("database").strip()
 SCOPE   = dbutils.widgets.get("secret_scope").strip()
+# Per-value-stream vault key, DERIVED upstream as sp-<value_stream>-dbrk-client-id and
+# passed in. Falls back to the legacy fixed key for older single-SP setups.
+CLIENT_ID_KEY = dbutils.widgets.get("client_id_key").strip() or "sp_client_id"
 _missing = [n for n, v in (("project_id", PROJECT), ("database", DB), ("secret_scope", SCOPE)) if not v]
 if _missing:
     raise ValueError(f"Missing required parameter(s): {', '.join(_missing)}. "
-                     f"Run with --params project_id=<slug>,database=<postgres_db>,secret_scope=<scope>.")
+                     f"Run with --params project_id=<slug>,database=<postgres_db>,secret_scope=<scope>[,client_id_key=<key>].")
 
-SP = dbutils.secrets.get(SCOPE, "sp_client_id")   # current Data API SP (from bootstrap)
+SP = dbutils.secrets.get(SCOPE, CLIENT_ID_KEY)   # Data API SP client id (per value stream)
 
 w = WorkspaceClient()
 parent = f"projects/{PROJECT}/branches/production"

@@ -156,14 +156,15 @@ jobs:
       # The notebook stays "grant one project + one database"; the loop lives here.
       - name: Grant Data API role
         if: ${{ inputs.run_data_api_grants }}
-        env:
-          SECRET_SCOPE: ${{ vars.LAKEBASE_SECRET_SCOPE }}   # per-env scope (e.g. sh-lakebase / kv-sh-ent-dpa-prd)
         run: |
-          SCOPE="${SECRET_SCOPE:-sh-lakebase}"
-          # Enumerate (project_id, database) pairs from the resolved bundle.
+          # Scope + client-id key are DERIVED (developer provides neither):
+          #   scope          = kv-sh-ent-dpa-<target>              (same for every stream, per env)
+          #   client_id_key  = sp-<value_stream>-dbrk-client-id    (per stream, from the value_stream tag)
+          SCOPE="kv-sh-ent-dpa-${{ inputs.target }}"
+          # Enumerate (project_id | database | client_id_key) from the resolved bundle.
           databricks bundle validate -t "${{ inputs.target }}" -o json --profile gh-actions > /tmp/bundle.json 2>/dev/null || true
-          mapfile -t PAIRS < <(python3 - "${{ inputs.target }}" <<'PY'
-          import json, re, sys
+          mapfile -t ROWS < <(python3 - <<'PY'
+          import json, re
           cfg = json.load(open("/tmp/bundle.json"))
           variables = cfg.get("variables", {})
           def rv(s):
@@ -171,23 +172,34 @@ jobs:
                             lambda m: str(variables.get(m.group(1),{}).get("value",
                                           variables.get(m.group(1),{}).get("default",""))), s)
           res = cfg.get("resources", {})
-          projects = {k: rv(str(v["project_id"])) for k,v in res.get("postgres_projects",{}).items()}
-          seen=set()
-          for c in res.get("postgres_catalogs",{}).values():
-              pk = re.search(r"postgres_projects\.([^.}]+)\.", str(c.get("branch","")))
+          # project key -> (project_id, value_stream from custom_tags)
+          projects = {}
+          for k, v in res.get("postgres_projects", {}).items():
+              vs = ""
+              for t in (v.get("custom_tags") or []):
+                  if t.get("key") == "value_stream":
+                      vs = str(t.get("value", "")); break
+              projects[k] = (rv(str(v["project_id"])), vs)
+          seen = set()
+          for c in res.get("postgres_catalogs", {}).values():
+              pk = re.search(r"postgres_projects\.([^.}]+)\.", str(c.get("branch", "")))
               db = c.get("postgres_database")
               if pk and db and pk.group(1) in projects:
-                  pair=(projects[pk.group(1)], db)
-                  if pair not in seen:
-                      seen.add(pair); print(f"{pair[0]}|{pair[1]}")
+                  pid, vs = projects[pk.group(1)]
+                  if not vs:
+                      continue  # no value_stream tag -> can't derive the key; skip
+                  key = f"sp-{vs}-dbrk-client-id"
+                  row = (pid, db, key)
+                  if row not in seen:
+                      seen.add(row); print(f"{pid}|{db}|{key}")
           PY
           )
-          if [ ${#PAIRS[@]} -eq 0 ]; then
-            echo "::warning::no (project,database) pairs found in the bundle — nothing to grant."
+          if [ ${#ROWS[@]} -eq 0 ]; then
+            echo "::warning::no (project,database,value_stream) rows found — nothing to grant."
           fi
-          for pair in "${PAIRS[@]}"; do
-            INST="${pair%%|*}"; DB="${pair##*|}"
-            echo "Granting Data API role for project_id=$INST database=$DB scope=$SCOPE"
+          for row in "${ROWS[@]}"; do
+            INST="${row%%|*}"; REST="${row#*|}"; DB="${REST%%|*}"; KEY="${REST##*|}"
+            echo "Granting Data API role for project_id=$INST database=$DB scope=$SCOPE client_id_key=$KEY"
             databricks bundle run setup_dataapi_role -t "${{ inputs.target }}" \
-              --params "project_id=$INST,database=$DB,secret_scope=$SCOPE" --profile gh-actions
+              --params "project_id=$INST,database=$DB,secret_scope=$SCOPE,client_id_key=$KEY" --profile gh-actions
           done

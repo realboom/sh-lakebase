@@ -28,6 +28,10 @@ resources:
           default: ""
         - name: secret_scope
           default: ""
+        # Vault key name holding the value stream's SP client id, derived upstream as
+        # sp-<value_stream>-dbrk-client-id. Defaults to the legacy fixed key if omitted.
+        - name: client_id_key
+          default: sp_client_id
       tasks:
         - task_key: setup_role
           notebook_task:
