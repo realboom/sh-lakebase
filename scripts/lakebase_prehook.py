@@ -291,6 +291,54 @@ def set_autoscale_window(
         log(f"Autoscale window set on {name}: {min_cu} -> {max_cu} CU{s2z}.")
 
 
+def grant_project_admin(cli: str, project_id: str, group: str, profile: str | None, dry_run: bool = False) -> None:
+    """
+    Grant an account GROUP CAN_MANAGE on a Lakebase project (the closest thing to
+    'owner' — Lakebase projects have no owner field, only CAN_USE/CAN_MANAGE ACLs).
+    Uses the Permissions API surface: `permissions update database-projects <id>`.
+    PATCH/update is additive, so this adds the grant without disturbing existing ACLs.
+    """
+    acl = {"access_control_list": [{"group_name": group, "permission_level": "CAN_MANAGE"}]}
+    cmd = [cli, "permissions", "update", "database-projects", project_id, "--json", json.dumps(acl)]
+    if profile:
+        cmd += ["-p", profile]
+    if dry_run:
+        log(f"DRY-RUN would grant CAN_MANAGE on project '{project_id}' to group '{group}'.")
+        return
+    proc = run(cmd, check=False, capture=True)
+    print(proc.stdout, end="")
+    if proc.returncode != 0:
+        log(f"WARNING: could not grant CAN_MANAGE on project '{project_id}' to '{group}' "
+            f"(exit {proc.returncode}). Grant it manually or re-run --phase post.")
+    else:
+        log(f"Granted CAN_MANAGE on project '{project_id}' to group '{group}'.")
+
+
+def grant_catalog_privileges(cli: str, catalog_id: str, group: str, profile: str | None, dry_run: bool = False) -> None:
+    """
+    Grant an account GROUP full control on a UC catalog WITHOUT transferring ownership
+    (the SP/creator stays owner). We add both ALL_PRIVILEGES and MANAGE because
+    ALL_PRIVILEGES intentionally EXCLUDES MANAGE (and EXTERNAL USE *). MANAGE is what
+    lets the group grant/revoke to others — so ALL_PRIVILEGES + MANAGE ≈ owner-level
+    control minus the owner role itself. `grants update catalog <id> --json {changes:[...]}`.
+    Catalog must exist (created by `bundle deploy`, which runs before this post phase).
+    """
+    changes = {"changes": [{"principal": group, "add": ["ALL_PRIVILEGES", "MANAGE"]}]}
+    cmd = [cli, "grants", "update", "catalog", catalog_id, "--json", json.dumps(changes)]
+    if profile:
+        cmd += ["-p", profile]
+    if dry_run:
+        log(f"DRY-RUN would grant ALL_PRIVILEGES + MANAGE on catalog '{catalog_id}' to group '{group}' (owner unchanged).")
+        return
+    proc = run(cmd, check=False, capture=True)
+    print(proc.stdout, end="")
+    if proc.returncode != 0:
+        log(f"WARNING: could not grant privileges on catalog '{catalog_id}' to '{group}' "
+            f"(exit {proc.returncode}). Grant it manually or re-run --phase post.")
+    else:
+        log(f"Granted ALL_PRIVILEGES + MANAGE on catalog '{catalog_id}' to group '{group}'.")
+
+
 # --------------------------------------------------------------------------- #
 # Step 2 — bind
 # --------------------------------------------------------------------------- #
@@ -376,6 +424,11 @@ def main() -> int:
                         help="Scale-to-zero idle timeout for --phase post, e.g. '300s' (5m), '3600s' (1h), "
                              "'604800s' (7d max). Enables scale-to-zero (NOT on by default here). "
                              "Pass '' to leave the endpoint's current suspend setting untouched. Default 300s.")
+    parser.add_argument("--admin-group", default="SH_ENTERPRISE_ADMIN",
+                        help="Account GROUP granted CAN_MANAGE on each Lakebase project and "
+                             "ALL_PRIVILEGES + MANAGE on each UC catalog (--phase post; owner NOT "
+                             "transferred — SP/creator stays owner). Pass '' to skip. "
+                             "Default SH_ENTERPRISE_ADMIN.")
     parser.add_argument("--dry-run", action="store_true",
                         help="Discover + print the planned actions per project, but do NOT create, bind, "
                              "or update anything. Safe to run first.")
@@ -402,7 +455,7 @@ def main() -> int:
     log(f"[phase={args.phase}] Found {len(items)} Lakebase project(s) to process: "
         + ", ".join(it["project_id"] for it in items))
 
-    # ---------------- PHASE: post (set autoscale window, AFTER deploy) ----------
+    # ---------------- PHASE: post (autoscale + scale-to-zero + admin grants, AFTER deploy) ----
     if args.phase == "post":
         for item in items:
             project_id = item["project_id"]
@@ -414,7 +467,14 @@ def main() -> int:
                     args.cli, project_id, bid, eid, args.min_cu, args.max_cu, args.profile,
                     suspend_timeout=(args.suspend_timeout or None), dry_run=args.dry_run,
                 )
-        log("Post-hook complete (autoscale windows + scale-to-zero set).")
+            # Admin group: CAN_MANAGE on the Lakebase project (closest to 'owner' — no
+            # owner concept there), and ALL_PRIVILEGES + MANAGE on each of the project's
+            # UC catalogs WITHOUT transferring ownership (SP/creator stays owner).
+            if args.admin_group:
+                grant_project_admin(args.cli, project_id, args.admin_group, args.profile, args.dry_run)
+                for _ckey, cat_id in item["catalogs"]:
+                    grant_catalog_privileges(args.cli, cat_id, args.admin_group, args.profile, args.dry_run)
+        log("Post-hook complete (autoscale + scale-to-zero + admin grants set).")
         return 0
 
     # ---------------- PHASE: pre (create-legacy + bind, BEFORE deploy) ----------
