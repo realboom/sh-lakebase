@@ -243,30 +243,52 @@ def create_legacy_instance(
 
 def set_autoscale_window(
     cli: str, project_id: str, branch_id: str, endpoint_id: str,
-    min_cu: float, max_cu: float, profile: str | None, dry_run: bool = False,
+    min_cu: float, max_cu: float, profile: str | None,
+    suspend_timeout: str | None = None, dry_run: bool = False,
 ) -> None:
     """
-    Set an endpoint's autoscaling window via the native CLI (no token-mint/curl).
-    DABs can't set this on an auto-created primary, so we do it post-deploy.
-    Constraints: min >= 0.5, max <= 64, (max - min) <= 16.
+    Set an endpoint's autoscaling window AND scale-to-zero suspend timeout via the
+    native CLI (no token-mint/curl), in a single update-endpoint call. DABs can't set
+    these on an auto-created primary, so we do it post-deploy.
+
+    Autoscaling constraints: min >= 0.5, max <= 64, (max - min) <= 16.
+    suspend_timeout: scale-to-zero idle timer, e.g. "300s" (5 min) .. "604800s" (7 days).
+      NOT on by default in this environment — pass it to enable scale-to-zero.
+      Omit (None) to leave the endpoint's current suspend setting untouched.
     """
     name = f"projects/{project_id}/branches/{branch_id}/endpoints/{endpoint_id}"
-    mask = "spec.autoscaling_limit_min_cu,spec.autoscaling_limit_max_cu"
-    body = json.dumps({"spec": {"autoscaling_limit_min_cu": min_cu, "autoscaling_limit_max_cu": max_cu}})
-    cmd = [cli, "postgres", "update-endpoint", name, mask, "--json", body]
-    if profile:
-        cmd += ["-p", profile]
+    s2z = f", scale-to-zero after {suspend_timeout}" if suspend_timeout else ""
     if dry_run:
-        log(f"DRY-RUN would set autoscale on {name}: {min_cu} -> {max_cu} CU.")
+        log(f"DRY-RUN would set autoscale on {name}: {min_cu} -> {max_cu} CU{s2z}.")
         return
-    proc = run(cmd, check=False, capture=True)
-    print(proc.stdout, end="")
-    if proc.returncode != 0:
-        # Non-fatal: log and continue so one endpoint doesn't abort the whole run.
-        log(f"WARNING: could not set autoscale window on {name} (exit {proc.returncode}). "
-            f"Set it manually or re-run --phase post.")
-    else:
-        log(f"Autoscale window set on {name}: {min_cu} -> {max_cu} CU.")
+
+    # Two SEPARATE update-endpoint calls: the autoscaling window and the suspend timeout
+    # use DIFFERENT update_mask paths and can't be combined. The suspend field is set via
+    # mask `spec.suspension` with body {"spec":{"suspend_timeout_duration":"<n>s"}} —
+    # NOT `spec.suspend_timeout_duration` (that path is rejected by the update_mask).
+    def _update(mask: str, spec: dict, label: str) -> bool:
+        cmd = [cli, "postgres", "update-endpoint", name, mask, "--json", json.dumps({"spec": spec})]
+        if profile:
+            cmd += ["-p", profile]
+        proc = run(cmd, check=False, capture=True)
+        print(proc.stdout, end="")
+        if proc.returncode != 0:
+            log(f"WARNING: could not set {label} on {name} (exit {proc.returncode}). "
+                f"Set it manually or re-run --phase post.")
+            return False
+        return True
+
+    ok_cu = _update(
+        "spec.autoscaling_limit_min_cu,spec.autoscaling_limit_max_cu",
+        {"autoscaling_limit_min_cu": min_cu, "autoscaling_limit_max_cu": max_cu},
+        "autoscale window",
+    )
+    ok_s2z = True
+    if suspend_timeout:
+        ok_s2z = _update("spec.suspension", {"suspend_timeout_duration": suspend_timeout},
+                         "scale-to-zero suspend timeout")
+    if ok_cu and ok_s2z:
+        log(f"Autoscale window set on {name}: {min_cu} -> {max_cu} CU{s2z}.")
 
 
 # --------------------------------------------------------------------------- #
@@ -350,6 +372,10 @@ def main() -> int:
                              "post = set the autoscale CU window (run AFTER `bundle deploy`). Default: pre.")
     parser.add_argument("--min-cu", type=float, default=0.5, help="Autoscale min CU for --phase post (default 0.5).")
     parser.add_argument("--max-cu", type=float, default=2.0, help="Autoscale max CU for --phase post (default 2.0).")
+    parser.add_argument("--suspend-timeout", default="300s",
+                        help="Scale-to-zero idle timeout for --phase post, e.g. '300s' (5m), '3600s' (1h), "
+                             "'604800s' (7d max). Enables scale-to-zero (NOT on by default here). "
+                             "Pass '' to leave the endpoint's current suspend setting untouched. Default 300s.")
     parser.add_argument("--dry-run", action="store_true",
                         help="Discover + print the planned actions per project, but do NOT create, bind, "
                              "or update anything. Safe to run first.")
@@ -385,9 +411,10 @@ def main() -> int:
             targets = item["endpoints"] or [(None, "production", "primary")]
             for _ekey, bid, eid in targets:
                 set_autoscale_window(
-                    args.cli, project_id, bid, eid, args.min_cu, args.max_cu, args.profile, args.dry_run,
+                    args.cli, project_id, bid, eid, args.min_cu, args.max_cu, args.profile,
+                    suspend_timeout=(args.suspend_timeout or None), dry_run=args.dry_run,
                 )
-        log("Post-hook complete (autoscale windows set).")
+        log("Post-hook complete (autoscale windows + scale-to-zero set).")
         return 0
 
     # ---------------- PHASE: pre (create-legacy + bind, BEFORE deploy) ----------

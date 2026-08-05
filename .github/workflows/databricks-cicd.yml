@@ -143,7 +143,7 @@ jobs:
       - name: Set autoscale window (post-deploy)
         run: |
           python3 scripts/lakebase_prehook.py --phase post --target "${{ inputs.target }}" \
-            --min-cu 0.5 --max-cu 2.0 --profile gh-actions
+            --min-cu 0.5 --max-cu 2.0 --suspend-timeout 300s --profile gh-actions
 
       # --- Grant the Data API SP its Postgres role (all projects x all databases) ---
       # Gated on run_data_api_grants because it has a MANUAL prerequisite: you must
