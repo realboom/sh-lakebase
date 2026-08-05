@@ -142,6 +142,10 @@ def extract_projects(config: dict) -> list[dict]:
     items = []
     for proj_key, proj in projects.items():
         project_id = resolve_vars(str(proj["project_id"]), config)
+        # pg_version from the bundle (int like 16/17/18). create-database-instance takes
+        # the workspace DEFAULT otherwise, which can differ from what the bundle declares —
+        # and pg_version is IMMUTABLE, so a mismatch means a destroy/recreate later. Pass it.
+        pg_version = proj.get("pg_version")
 
         # branches whose parent references THIS project
         my_branches = []
@@ -171,6 +175,7 @@ def extract_projects(config: dict) -> list[dict]:
         items.append({
             "proj_key": proj_key,
             "project_id": project_id,
+            "pg_version": pg_version,
             "branches": my_branches,
             "endpoints": my_endpoints,
             "catalogs": my_catalogs,
@@ -209,15 +214,31 @@ def instance_exists(cli: str, name: str, profile: str | None) -> bool:
     return False
 
 
-def create_legacy_instance(cli: str, name: str, capacity: str, profile: str | None, dry_run: bool = False) -> None:
+def create_legacy_instance(
+    cli: str, name: str, capacity: str, profile: str | None,
+    pg_version: int | str | None = None, dry_run: bool = False,
+) -> None:
+    # IMPORTANT — we create via the LEGACY `database create-database-instance` on purpose:
+    # this is the provisioned path that unlocks DUAL NETWORKING (the whole reason for this
+    # pre-hook). That path is pinned to Postgres 16 — it does NOT honor a requested
+    # pg_version (verified: passing PG_VERSION_17 still yields 16). Version choice (16/17/18)
+    # is only available via the NEW `postgres create-project` API (what the UI uses), but
+    # that path is not confirmed to give dual networking, so we don't use it here.
+    # Net: instances created by this hook are pg16 by constraint until SDPL replaces the
+    # whole dual-networking cutover (at which point this pre-hook is removed). The bundle
+    # may still declare pg_version: 17 — DABs tolerates the mismatch on a bound instance
+    # (no destroy/recreate), and it's correct for a future version-flexible create path.
+    # `pg_version` is accepted here only for signature stability; it is intentionally NOT
+    # passed to the legacy create.
     cmd = [cli, "database", "create-database-instance", name, "--capacity", capacity]
     if profile:
         cmd += ["-p", profile]
     if dry_run:
-        log(f"DRY-RUN would create instance '{name}' (capacity={capacity}): $ " + " ".join(cmd))
+        log(f"DRY-RUN would create instance '{name}' (capacity={capacity}, pg16 — legacy/dual-networking path): $ "
+            + " ".join(cmd))
         return
     run(cmd)  # CLI waits for AVAILABLE by default
-    log(f"Instance '{name}' created and AVAILABLE (capacity={capacity}).")
+    log(f"Instance '{name}' created and AVAILABLE (capacity={capacity}, pg16 — legacy/dual-networking path).")
 
 
 def set_autoscale_window(
@@ -384,7 +405,8 @@ def main() -> int:
         # First-time cutover: create legacy-provisioned (unlocks Dual Networking), then bind.
         cap_var = config.get("variables", {}).get("capacity", {})
         capacity = cap_var.get("value") or cap_var.get("default") or "CU_1"
-        create_legacy_instance(args.cli, item["project_id"], capacity, args.profile, args.dry_run)
+        create_legacy_instance(args.cli, item["project_id"], capacity, args.profile,
+                               item.get("pg_version"), args.dry_run)
 
         log("Binding autoscaling resource keys to the newly-created instance...")
         bind_item(args.cli, item, args.target, args.profile, args.dry_run)
