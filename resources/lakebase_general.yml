@@ -59,6 +59,8 @@ resources:
           value: data-architecture
         - key: managed_by
           value: dabs
+        - key: value_stream
+          value: general
 
   # ---- UC catalogs: one per Postgres database (exposes public schema to UC) ----
   # Each entry registers a Postgres database into Unity Catalog as a catalog.

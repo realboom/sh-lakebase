@@ -1,0 +1,128 @@
+# =============================================================================
+# Lakebase instance: risk  (SELF-CONTAINED per-instance definition)
+# =============================================================================
+# ONE file = ONE Lakebase instance and everything it owns: the autoscaling
+# project + its UC catalog registrations.
+#
+# NAMING (new convention — team feedback 2026-07):
+#   • Instance  : dev-sh-lkb-risk   (hyphens — instance/endpoint names are
+#                 DNS-safe; underscores are NOT allowed. The env prefix comes
+#                 from ${var.environment} so dev->dev-…, prod->prod-….)
+#   • UC catalog: dev_sh_lkb_risk_* (underscores — UC catalog names cannot
+#                 contain hyphens. One catalog per Postgres database.)
+#   Env lives in the name via ${var.environment}; org=sh, type token=lkb.
+#   The instance is the compute/isolation boundary; the databases are the apps.
+#
+# DESIGN (for now):
+#   • 2 databases, each registered into Unity Catalog as its own catalog:
+#       - epic_census  -> catalog ${env}_sh_lkb_epic_census
+#       - healow       -> catalog ${env}_sh_lkb_healow
+#   • Each database uses the default `public` schema. Registering the database
+#     as a UC catalog exposes ALL its schemas (incl. public) to Unity Catalog.
+#   • Synced tables (below) land in each database's `public` schema. Sources are
+#     carried over from proj_b (proj_c had no synced tables — catalog only):
+#       epic_census.public : billing_usage (system.billing.usage),
+#                            node_types    (system.compute.node_types)
+#       healow.public      : query_history (system.query.history),
+#                            audit         (system.access.audit)
+#     NOTE: the epic_census/healow split of these 4 tables is a placeholder
+#     mapping — they're system tables used to prove out sync into each database.
+#     Swap in real Epic-census / Healow sources when available.
+#
+# LIFECYCLE (create via CLI first, then adopt — mirrors proj_b):
+#   1. databricks database create-database-instance dev-sh-lkb-risk --capacity CU_1
+#   2. databricks bundle deployment bind sh_lkb_risk projects/dev-sh-lkb-risk -t dev
+#   3. databricks bundle deploy -t dev
+#   4. PATCH the primary endpoint to the 0.5->2 CU window (DABs can't; see runbook)
+#
+# WARNING: project_id and pg_version are immutable after creation — DABs cannot
+# replace a Lakebase project in place. To change them, delete the project first.
+# =============================================================================
+
+resources:
+
+  # ---- The autoscaling project (the instance / compute boundary) ----
+  postgres_projects:
+    sh_lkb_risk:
+      project_id: ${var.environment}-sh-lkb-risk
+      display_name: SH Lakebase risk (${var.environment})
+      pg_version: 17            # immutable after creation
+      # custom_tags: CONFIRMED NO-OP through CLI v1.5.0 (validates/deploys but not
+      # applied; get-project returns custom_tags: null). Kept as intent. For real
+      # cost attribution use a budget/usage policy + budget_policy_id.
+      custom_tags:
+        - key: project
+          value: ${var.environment}-sh-lkb-risk
+        - key: environment
+          value: ${var.environment}
+        - key: cost_center
+          value: data-architecture
+        - key: managed_by
+          value: dabs
+        - key: value_stream
+          value: risk
+        # Data API wiring (used later by setup_dataapi_role, read from the resolved
+        # bundle JSON — not from the deployed instance, since custom_tags are a no-op
+        # on the Lakebase project through CLI v1.5.0). The secret SCOPE is derived per
+        # env as kv-sh-ent-dpa-${environment}; this is the vault KEY NAME inside that
+        # scope holding THIS value stream's SP client id.
+        - key: dataapi_client_id_key
+          value: kv-sp-risk-client-id
+
+  # ---- UC catalogs: one per Postgres database (exposes public schema to UC) ----
+  # Each entry registers a Postgres database into Unity Catalog as a catalog.
+  # create_database_if_missing: true -> DABs creates the database (with its
+  # default `public` schema) on first deploy if it doesn't already exist.
+  postgres_catalogs:
+    sh_lkb_risk_healow:
+      catalog_id: ${var.environment}_sh_lkb_healow
+      postgres_database: databricks_postgres
+      branch: ${resources.postgres_projects.sh_lkb_risk.id}/branches/production
+      # false: databricks_postgres is the default, auto-provisioned DB — it always
+      # exists, so we register it rather than create it. (true would also work as a
+      # no-op, but false correctly signals "this DB pre-exists".)
+      create_database_if_missing: false
+
+  # ---- Synced tables (UC Delta source -> Postgres public schema, per database) ----
+  # {catalog} references the postgres_catalogs resource (not a var) ON PURPOSE:
+  # the ${resources...} edge makes DABs create catalog+database BEFORE the synced
+  # tables so a fresh deploy succeeds in one pass (a plain var races -> CATALOG_DOES_NOT_EXIST).
+  # Sources carried over from proj_b; landed in each database's `public` schema.
+  postgres_synced_tables:
+    # ---- database: databricks_postgres (default, auto-provisioned) / schema: public ----
+    risk_healow_audit:
+      synced_table_id: ${resources.postgres_catalogs.sh_lkb_risk_healow.catalog_id}.public.audit
+      source_table_full_name: system.access.audit
+      postgres_database: databricks_postgres
+      branch: ${resources.postgres_projects.sh_lkb_risk.id}/branches/production
+      primary_key_columns:
+        - event_id
+      scheduling_policy: SNAPSHOT
+      create_database_objects_if_missing: true
+      new_pipeline_spec:
+        storage_catalog: ${var.pg_storage_catalog}
+        storage_schema: ${var.pg_storage_schema}
+
+  # ---- Scheduled refresh for the SNAPSHOT synced tables ----
+  # SNAPSHOT synced tables have NO built-in schedule field — a SNAPSHOT only syncs
+  # when triggered. To run on a cadence, wrap each synced table's PIPELINE in a job
+  # with a cron trigger. We use ONE job per database (groups that DB's tables) and
+  # reference the synced-table pipeline_id via its DABs resource — no hardcoded ids.
+  jobs:
+    # Job KEYS are bundle-global (not per-file), so this must be stream-unique —
+    # `refresh_healow_snapshots` (unprefixed) collides with lakebase_general.yml.
+    risk_refresh_healow_snapshots:
+      name: "[SH Lakebase] Refresh risk healow snapshots (${var.environment})"
+      # daily at 09:00 America/Denver (Utah) — see epic_census job for cron notes
+      schedule:
+        quartz_cron_expression: "0 0 9 * * ?"
+        timezone_id: America/Denver
+        pause_status: UNPAUSED
+      tasks:
+        - task_key: audit
+          pipeline_task:
+            pipeline_id: ${resources.postgres_synced_tables.risk_healow_audit.status.pipeline_id}
+
+  # NOTE: ops jobs (setup_dataapi_role, setup_synced_table_grants, dataapi_examples)
+  # are shared/reusable in resources/jobs.yml and run per-instance with --params,
+  # e.g. --params project_id=dev-sh-lkb-risk,database=epic_census,secret_scope=sh-lakebase

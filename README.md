@@ -17,6 +17,7 @@ Select Health Lakebase environment as a Databricks Asset Bundle (DABs).
 | `sql/schema.sql` | Table + index DDL to paste into the **Lakebase SQL Editor** when the environment can't open a direct Postgres (5432) connection (so the `setup_schema` job can't run) |
 | `sql/dataapi_role_setup.sql` | Service-principal role grants for the PostgREST Data API (manual, post-enable) |
 | `scripts/bootstrap_identity.sh` | Re-runnable: creates the SP + OAuth secret, the admin/operator groups, and the secret scope for a fresh FEVM workspace (run before `bundle deploy`) |
+| `scripts/lakebase_prehook.py` | CI/CD pre-hook: for **every** `postgres_projects` across all `resources/lakebase_*.yml`, creates the instance the legacy-provisioned way if missing (unlocks Dual Networking) and binds the autoscaling keys. `--phase post` sets the autoscale CU window after deploy. `--dry-run` prints the plan without acting; `--only <id>` scopes to one value stream. |
 
 DABs manages the **infrastructure** (project/branch/endpoint) and the **jobs**. The table
 DDL lives in `src/setup_schema.py` (psycopg2) **and** mirrored in `sql/schema.sql` for
@@ -69,6 +70,38 @@ provide — SP `run_as` requires re-granting `servicePrincipal.user` on a new SP
 and a SCIM SP has no home folder for `root_path`. So prod is operated like dev. The
 `lakebase-deploy` SP still exists (bootstrap) and powers the **Data API** via the secret
 scope. Restore governance only for a long-lived (non-FEVM) prod deployed via CI as the SP.
+
+## CI/CD auth: the `gh-actions` profile (MSAL vs OAuth-M2M)
+
+The GitHub workflow (`.github/workflows/databricks-cicd.yml`) authenticates every CLI
+call with **`--profile gh-actions`**, written to `~/.databrickscfg` by the "Set up
+Databricks CLI authentication" step. **Only the auth lines in that profile differ between
+environments — the profile NAME stays `gh-actions`, so nothing downstream changes.**
+
+Client (real) — Managed Identity / MSAL:
+```ini
+[gh-actions]
+host            = <workspace-url>
+azure_client_id = <ARM_CLIENT_ID>
+azure_use_msi   = true
+```
+
+This repo's test workspace — OAuth M2M service principal (MSAL can't be reproduced on
+this workspace's Entra tenant):
+```ini
+[gh-actions]
+host          = <workspace-url>
+client_id     = <DATABRICKS_CLIENT_ID>
+client_secret = <DATABRICKS_CLIENT_SECRET>
+```
+
+To switch between them, swap only the auth lines in the cfg-writing step. **Do NOT also
+set `DATABRICKS_*` as job/step env vars** — env auth OVERRIDES the profile (env wins over
+`.databrickscfg`), causing silent auth-source confusion. Auth lives in the profile only.
+
+GitHub Environment settings the workflow expects, per target:
+`vars.DATABRICKS_HOST`, `vars.DATABRICKS_CLIENT_ID` (or `vars.ARM_CLIENT_ID` for MSAL),
+`secrets.DATABRICKS_CLIENT_SECRET`, and optional `vars.LAKEBASE_SECRET_SCOPE`.
 
 ## FEVM rebuild cycle (~every 2 weeks)
 

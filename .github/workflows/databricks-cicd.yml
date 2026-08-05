@@ -18,7 +18,9 @@ on:
     branches: [main]
   push:
     branches: [main]
-  # Manual trigger for onboarding a Lakebase instance OR just updating an existing one.
+  # Manual trigger. Provisioning/create/bind is now automatic (the Python pre-hook
+  # reads every project from resources/lakebase_*.yml), so no instance/capacity
+  # inputs are needed. Only two knobs remain:
   workflow_dispatch:
     inputs:
       target:
@@ -26,29 +28,8 @@ on:
         type: choice
         options: [dev, prod]
         default: dev
-      create_new_instance:
-        description: "Create a NEW provisioned instance? (leave UNCHECKED to only deploy changes to an existing autoscale instance)"
-        type: boolean
-        default: false
-      resource_key:
-        description: "DABs postgres_projects KEY for the new instance (underscores, e.g. sh_lakebase_proj_b) — must already exist in a committed resources/lakebase_proj_*.yml"
-        type: string
-        required: false
-      instance_name:
-        description: "New instance SLUG / project_id (hyphens, e.g. sh-lakebase-is-proj-b) — must be a fresh, never-used slug"
-        type: string
-        required: false
-      capacity:
-        description: "Provisioned SKU for the create step (transient)"
-        type: choice
-        options: [CU_1, CU_2]
-        default: CU_1
-      database:
-        description: "Postgres database name — must match the instance's catalog `postgres_database` (e.g. sh_is_lakebase). Used by the Data API grant step."
-        type: string
-        default: sh_is_lakebase
       run_data_api_grants:
-        description: "Run Data API role grants? (check ONLY after you have manually clicked 'Enable Data API' on the instance in the UI — that step creates the authenticator role the grants need)"
+        description: "Run Data API role grants for all projects/databases? (check ONLY after you have manually clicked 'Enable Data API' on each instance in the UI — that step creates the authenticator role the grants need)"
         type: boolean
         default: false
 
@@ -66,7 +47,7 @@ jobs:
       DATABRICKS_CLIENT_ID: ${{ secrets.DATABRICKS_CLIENT_ID }}
       DATABRICKS_CLIENT_SECRET: ${{ secrets.DATABRICKS_CLIENT_SECRET }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - uses: databricks/setup-cli@main
       - run: databricks bundle validate -t dev
 
@@ -91,78 +72,121 @@ jobs:
   #     - name: Deploy prod
   #       run: databricks bundle deploy -t prod
 
-  # ---- Manual: onboard a NEW instance OR update an existing one ----
-  # The create/bind/patch steps are GATED on inputs.create_new_instance.
-  # Uncheck the box -> only `bundle deploy` runs (the update-existing path).
+  # ---- Manual: onboard + reconcile all Lakebase value streams ----
+  # The Python pre-hook auto-creates/binds any missing instance (from every
+  # resources/lakebase_*.yml), deploy reconciles catalogs/synced tables/jobs, then
+  # the post phase sets autoscale. Data API grants run only if the box is checked.
   onboard-lakebase:
     if: github.event_name == 'workflow_dispatch'
     runs-on: self-hosted
     environment: ${{ inputs.target }}   # binds creds + (for prod) approval gate to the chosen target
     concurrency: onboard-${{ inputs.target }}
-    env:
-      DATABRICKS_HOST: ${{ vars.DATABRICKS_HOST }}
-      DATABRICKS_CLIENT_ID: ${{ secrets.DATABRICKS_CLIENT_ID }}
-      DATABRICKS_CLIENT_SECRET: ${{ secrets.DATABRICKS_CLIENT_SECRET }}
+    # NOTE: NO job-level DATABRICKS_* env block. Auth is done entirely through the
+    # `gh-actions` profile written below — env vars would OVERRIDE the profile
+    # (env wins over .databrickscfg) and cause silent auth-source confusion.
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - uses: databricks/setup-cli@main
 
-      # --- ONE-TIME steps: only when creating a brand-new instance ---
-      - name: (new) Create provisioned instance
-        if: ${{ inputs.create_new_instance }}
+      # --- Auth: write the `gh-actions` CLI profile ---
+      # Every step below authenticates with `--profile gh-actions`. Only the auth
+      # LINES below differ between environments — the profile NAME stays `gh-actions`
+      # so nothing downstream changes:
+      #   • CLIENT (real): Managed Identity / MSAL — replace the client_id/secret
+      #     lines with:   azure_client_id = ${{ vars.ARM_CLIENT_ID }}
+      #                    azure_use_msi   = true
+      #   • THIS (test):  OAuth M2M service principal (client id + secret), since
+      #     MSAL/managed-identity can't be reproduced on this workspace's tenant.
+      - name: Set up Databricks CLI authentication (OAuth M2M service principal)
+        shell: bash
         run: |
-          databricks database create-database-instance "${{ inputs.instance_name }}" \
-            --capacity "${{ inputs.capacity }}"
+          mkdir -p ~/.databricks
+          cat > ~/.databrickscfg <<EOF
+          [gh-actions]
+          host          = ${{ vars.DATABRICKS_HOST }}
+          client_id     = ${{ vars.DATABRICKS_CLIENT_ID }}
+          client_secret = ${{ secrets.DATABRICKS_CLIENT_SECRET }}
+          EOF
+          # (Do NOT `cat` the file — client_secret would print to the CI log.)
 
-      - name: (new) Bind autoscaling project into DABs state
-        if: ${{ inputs.create_new_instance }}
+      # --- Pre-hook: automated legacy-provision -> bind cutover (all projects) ---
+      # Replaces the old input-driven Create + Bind steps. The Python pre-hook reads
+      # every postgres_projects entry across resources/lakebase_*.yml and, for each:
+      #   • creates the instance the legacy-provisioned way IF it doesn't exist
+      #     (this is what unlocks Dual Networking), waits for AVAILABLE, then
+      #   • binds the autoscaling keys it declares (project always; branch/endpoint
+      #     only if declared; catalog only if it already exists).
+      # If an instance already exists it's a no-op. No workflow inputs needed —
+      # the bundle itself is the source of truth. Auth comes from the env vars above.
+      # Use --only <project_id|key> to cut over a single value stream at a time.
+      - name: Lakebase pre-hook (create-legacy + bind)
         run: |
-          databricks bundle deployment bind "${{ inputs.resource_key }}" \
-            "projects/${{ inputs.instance_name }}" -t "${{ inputs.target }}" --auto-approve
+          # Sanity-check the profile resolves (host comes from the gh-actions profile,
+          # not an env var). Fails fast with a clear message if auth didn't get written.
+          if ! databricks current-user me --profile gh-actions >/dev/null 2>&1; then
+            echo "::error::gh-actions profile did not authenticate. Check DATABRICKS_HOST / client_id / client_secret (or MSAL config) in the '${{ inputs.target }}' GitHub Environment."
+            exit 1
+          fi
+          python3 scripts/lakebase_prehook.py --target "${{ inputs.target }}" --profile gh-actions
 
-      # --- ALWAYS runs: this is the update-existing path (and finishes a new create) ---
+      # --- ALWAYS runs: reconciles the bundle (catalogs, synced tables, jobs) ---
       - name: Validate
-        run: databricks bundle validate -t "${{ inputs.target }}"
+        run: databricks bundle validate -t "${{ inputs.target }}" --profile gh-actions
       - name: Deploy
-        run: databricks bundle deploy -t "${{ inputs.target }}"
+        run: databricks bundle deploy -t "${{ inputs.target }}" --auto-approve --profile gh-actions
 
-      # --- ONE-TIME: set the 0.5->2 CU window on the new instance's primary endpoint ---
-      # DABs cannot set this on an auto-created primary (silent no-op), so PATCH directly.
-      # Mint the OAuth token straight from the SP creds via /oidc/v1/token — do NOT use
-      # `databricks auth token`, which needs the OS keyring (unreachable on a headless
-      # self-hosted runner: "OS keyring unreachable: exit status 36" -> empty token -> 401).
-      - name: (new) Set autoscaling window 0.5 -> 2
-        if: ${{ inputs.create_new_instance }}
+      # --- POST-deploy: set the 0.5->2 CU autoscale window on each project's endpoint ---
+      # DABs can't set this on an auto-created primary, so the pre-hook does it via the
+      # native `databricks postgres update-endpoint` CLI (no token-mint/curl needed).
+      # Runs for ALL projects in the bundle, on the production/primary endpoint (or any
+      # declared postgres_endpoints). Non-fatal per endpoint so one failure won't abort.
+      - name: Set autoscale window (post-deploy)
         run: |
-          TOKEN=$(curl -s -X POST "$DATABRICKS_HOST/oidc/v1/token" \
-            -u "$DATABRICKS_CLIENT_ID:$DATABRICKS_CLIENT_SECRET" \
-            -d "grant_type=client_credentials&scope=all-apis" | jq -r .access_token)
-          if [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then echo "failed to mint OAuth token"; exit 1; fi
-          curl -s -X PATCH -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-            "$DATABRICKS_HOST/api/2.0/postgres/projects/${{ inputs.instance_name }}/branches/production/endpoints/primary?update_mask=spec.autoscaling_limit_min_cu,spec.autoscaling_limit_max_cu" \
-            -d '{"spec":{"autoscaling_limit_min_cu":0.5,"autoscaling_limit_max_cu":2}}' \
-            -w "\n[HTTP %{http_code}]\n"
+          python3 scripts/lakebase_prehook.py --phase post --target "${{ inputs.target }}" \
+            --min-cu 0.5 --max-cu 2.0 --profile gh-actions
 
-      # --- Grant the Data API SP its Postgres role ---
-      # Gated on run_data_api_grants (NOT create) because it has a MANUAL prerequisite:
-      # you must click "Enable Data API" on the instance in the UI first — that creates
-      # the `authenticator` role the grant depends on. There is no API to enable it.
-      # Job key is derived from resource_key: sh_lakebase_proj_<x> -> proj_<x>_setup_dataapi_role
-      # Runs the SHARED, reusable setup_dataapi_role job with the instance's params.
-      # (Jobs are created once in resources/jobs.yml; instance_name is passed at run time.)
+      # --- Grant the Data API SP its Postgres role (all projects x all databases) ---
+      # Gated on run_data_api_grants because it has a MANUAL prerequisite: you must
+      # click "Enable Data API" on each instance in the UI first — that creates the
+      # `authenticator` role the grant depends on (no API to enable it).
+      # No instance_name/database inputs: we enumerate every (project_id, database)
+      # pair from the bundle (postgres_catalogs.postgres_database across all
+      # resources/lakebase_*.yml) and run the shared setup_dataapi_role job per pair.
+      # The notebook stays "grant one project + one database"; the loop lives here.
       - name: Grant Data API role
         if: ${{ inputs.run_data_api_grants }}
+        env:
+          SECRET_SCOPE: ${{ vars.LAKEBASE_SECRET_SCOPE }}   # per-env scope (e.g. sh-lakebase / kv-sh-ent-dpa-prd)
         run: |
-          INST="${{ inputs.instance_name }}"
-          if [ -z "$INST" ]; then
-            echo "::error::instance_name is required when run_data_api_grants is checked (e.g. sh-lakebase-is-proj-b)"
-            exit 1
+          SCOPE="${SECRET_SCOPE:-sh-lakebase}"
+          # Enumerate (project_id, database) pairs from the resolved bundle.
+          databricks bundle validate -t "${{ inputs.target }}" -o json --profile gh-actions > /tmp/bundle.json 2>/dev/null || true
+          mapfile -t PAIRS < <(python3 - "${{ inputs.target }}" <<'PY'
+          import json, re, sys
+          cfg = json.load(open("/tmp/bundle.json"))
+          variables = cfg.get("variables", {})
+          def rv(s):
+              return re.sub(r"\$\{var\.([A-Za-z_]\w*)\}",
+                            lambda m: str(variables.get(m.group(1),{}).get("value",
+                                          variables.get(m.group(1),{}).get("default",""))), s)
+          res = cfg.get("resources", {})
+          projects = {k: rv(str(v["project_id"])) for k,v in res.get("postgres_projects",{}).items()}
+          seen=set()
+          for c in res.get("postgres_catalogs",{}).values():
+              pk = re.search(r"postgres_projects\.([^.}]+)\.", str(c.get("branch","")))
+              db = c.get("postgres_database")
+              if pk and db and pk.group(1) in projects:
+                  pair=(projects[pk.group(1)], db)
+                  if pair not in seen:
+                      seen.add(pair); print(f"{pair[0]}|{pair[1]}")
+          PY
+          )
+          if [ ${#PAIRS[@]} -eq 0 ]; then
+            echo "::warning::no (project,database) pairs found in the bundle — nothing to grant."
           fi
-          DB="${{ inputs.database }}"
-          if [ -z "$DB" ]; then
-            echo "::error::database is required when run_data_api_grants is checked (e.g. sh_is_lakebase)"
-            exit 1
-          fi
-          echo "Granting Data API role for project_id=$INST database=$DB"
-          databricks bundle run setup_dataapi_role -t "${{ inputs.target }}" \
-            --params "project_id=$INST,database=$DB,secret_scope=sh-lakebase"
+          for pair in "${PAIRS[@]}"; do
+            INST="${pair%%|*}"; DB="${pair##*|}"
+            echo "Granting Data API role for project_id=$INST database=$DB scope=$SCOPE"
+            databricks bundle run setup_dataapi_role -t "${{ inputs.target }}" \
+              --params "project_id=$INST,database=$DB,secret_scope=$SCOPE" --profile gh-actions
+          done
