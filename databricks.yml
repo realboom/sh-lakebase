@@ -33,7 +33,9 @@ variables:
   # writable catalog; set to the customer's medallion catalog (e.g. dev_sh_bronze) per env.
   pg_storage_catalog:
     description: UC catalog for synced-table pipeline checkpoints/logs
-    default: classic_stable_7fnjo6      # dev (test workspace); customer dev -> dev_sh_bronze
+    # A standard UC catalog the deploy identity can create tables in. Set per env
+    # (e.g. the customer's medallion catalog such as dev_sh_bronze).
+    default: <your-dev-storage-catalog>
   pg_storage_schema:
     description: Schema under pg_storage_catalog for pipeline state
     default: default
@@ -66,10 +68,10 @@ targets:
     mode: development
     default: true
     workspace:
-      # FEVM rebuilds this workspace ~every 2 weeks with a NEW host — update this line
-      # each time. Nothing else is workspace-pinned (workspace id + endpoint host are
-      # derived at runtime by the notebooks).
-      host: https://adb-XXXXXXXXXXXXXXXX.NN.azuredatabricks.net
+      # Set this to your dev Azure Databricks workspace URL.
+      # Nothing else is workspace-pinned (workspace id + endpoint host are derived at
+      # runtime by the notebooks).
+      host: https://<your-dev-workspace>.azuredatabricks.net
 
   # Prod = the production workspace. mode: production disables name-prefixing and
   # forces an explicit, deterministic deploy. Never the default target, so prod is
@@ -80,7 +82,7 @@ targets:
       pg_storage_catalog: prod_sh_bronze        # customer prod medallion catalog
       environment: prod                         # also the catalog prefix (prod_sh_lakebase_is_proj_*)
     workspace:
-      host: https://adb-XXXXXXXXXXXXXXXX.NN.azuredatabricks.net
+      host: https://adb-7405616852753670.10.azuredatabricks.net
       # Deterministic single deploy location (prod mode requires an explicit root_path).
       # /Workspace/Shared is writable by the deployer (validate warns world-writable —
       # acceptable for this operator-run prod).

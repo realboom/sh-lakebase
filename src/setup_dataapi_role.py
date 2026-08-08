@@ -23,20 +23,33 @@ from databricks.sdk import WorkspaceClient
 # (job --params or notebook widgets).
 dbutils.widgets.text("project_id", "")
 dbutils.widgets.text("database", "")
+# PRIMARY: pass the SP application id directly (sourced from the project's permissions
+# block by the pre-hook). This drops the Databricks-secret-scope dependency entirely.
+dbutils.widgets.text("identity", "")
+# LEGACY FALLBACK (original repo): read the SP id from a secret scope. Used only if
+# `identity` is blank. Kept so the original single-SP/KV setup still works.
 dbutils.widgets.text("secret_scope", "")
 dbutils.widgets.text("client_id_key", "")   # vault key name holding the SP client id
-PROJECT = dbutils.widgets.get("project_id").strip()
-DB      = dbutils.widgets.get("database").strip()
-SCOPE   = dbutils.widgets.get("secret_scope").strip()
-# Per-value-stream vault key, DERIVED upstream as sp-<value_stream>-dbrk-client-id and
-# passed in. Falls back to the legacy fixed key for older single-SP setups.
+PROJECT  = dbutils.widgets.get("project_id").strip()
+DB       = dbutils.widgets.get("database").strip()
+IDENTITY = dbutils.widgets.get("identity").strip()
+SCOPE    = dbutils.widgets.get("secret_scope").strip()
 CLIENT_ID_KEY = dbutils.widgets.get("client_id_key").strip() or "sp_client_id"
-_missing = [n for n, v in (("project_id", PROJECT), ("database", DB), ("secret_scope", SCOPE)) if not v]
+_missing = [n for n, v in (("project_id", PROJECT), ("database", DB)) if not v]
 if _missing:
     raise ValueError(f"Missing required parameter(s): {', '.join(_missing)}. "
-                     f"Run with --params project_id=<slug>,database=<postgres_db>,secret_scope=<scope>[,client_id_key=<key>].")
+                     f"Run with --params project_id=<slug>,database=<postgres_db>,identity=<sp_app_id> "
+                     f"(or legacy secret_scope=<scope>[,client_id_key=<key>]).")
 
-SP = dbutils.secrets.get(SCOPE, CLIENT_ID_KEY)   # Data API SP client id (per value stream)
+# SP id: prefer the direct `identity` param; fall back to the secret scope for the
+# legacy setup. One of the two must resolve.
+if IDENTITY:
+    SP = IDENTITY
+elif SCOPE:
+    SP = dbutils.secrets.get(SCOPE, CLIENT_ID_KEY)   # legacy per-value-stream vault key
+else:
+    raise ValueError("Provide the SP application id via `identity=<sp_app_id>` "
+                     "(preferred) or the legacy `secret_scope=<scope>[,client_id_key=<key>]`.")
 
 w = WorkspaceClient()
 parent = f"projects/{PROJECT}/branches/production"
@@ -59,13 +72,30 @@ try:
 except psycopg2.Error as e:
     print(f"role {SP} already exists or create skipped: {e}")
 
-# GRANTs are idempotent — safe to re-run. Identifiers must be quoted (the SP id has hyphens).
-for stmt in (
-    f'GRANT "{SP}" TO authenticator',
-    f'GRANT USAGE ON SCHEMA public TO "{SP}"',
-    f'GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO "{SP}"',
-    f'GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO "{SP}"',
-):
-    cur.execute(stmt)
+# The one grant that specifically needs superuser and enables the Data API path:
+# let PostgREST's `authenticator` assume this SP's role. Not schema-scoped.
+cur.execute(f'GRANT "{SP}" TO authenticator')
+
+# Table/sequence DML: enumerate ALL user schemas (not just `public`) so a developer
+# adding a new database/schema gets Data API access on the next run. Mirrors the schema
+# enumeration in setup_data_role. GRANTs are idempotent; identifiers quoted (SP id has hyphens).
+cur.execute("""
+    SELECT schema_name FROM information_schema.schemata
+    WHERE schema_name NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+      AND schema_name NOT LIKE 'pg_temp%' AND schema_name NOT LIKE 'pg_toast_temp%'
+    ORDER BY schema_name
+""")
+schemas = [r[0] for r in cur.fetchall()]
+print(f"granting on schemas: {schemas}")
+for sch in schemas:
+    for stmt in (
+        f'GRANT USAGE ON SCHEMA "{sch}" TO "{SP}"',
+        f'GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA "{sch}" TO "{SP}"',
+        f'GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA "{sch}" TO "{SP}"',
+        # Cover objects created later, too.
+        f'ALTER DEFAULT PRIVILEGES IN SCHEMA "{sch}" GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO "{SP}"',
+        f'ALTER DEFAULT PRIVILEGES IN SCHEMA "{sch}" GRANT USAGE, SELECT ON SEQUENCES TO "{SP}"',
+    ):
+        cur.execute(stmt)
 c.close()
-print("Data API role setup complete")
+print(f"Data API role setup complete for {SP} on {len(schemas)} schema(s)")

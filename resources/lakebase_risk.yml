@@ -47,6 +47,24 @@ resources:
       project_id: ${var.environment}-sh-lkb-risk
       display_name: SH Lakebase risk (${var.environment})
       pg_version: 17            # immutable after creation
+      # ---- Permissions (scoped to THIS project) ----
+      # service_principal_name is the SP's APPLICATION (client) id.
+      # NOTE: this is the INSTANCE/project ACL (platform management), NOT Postgres
+      # data access. Enum is CAN_CREATE / CAN_USE / CAN_MANAGE (bundles assign only the
+      # latter two; all users get CAN_CREATE implicitly). Actual table read/write is
+      # granted separately via a Postgres OAuth role + GRANT (setup_dataapi_role).
+      permissions:
+        # app/valuestream SP: CAN_USE = discover project + view the connection URI to
+        # connect. It does NOT manage the instance, assign perms, or create/delete
+        # branches (those are CAN_MANAGE-only). Its DML comes from the Postgres role
+        # grant, not this ACL. Replace with your app SP's application (client) id.
+        - service_principal_name: <app-sp-application-id>
+          level: CAN_USE
+        # Developer GROUP (a Databricks account group). Replaces naming individual
+        # developers. Members get CAN_MANAGE on the project; their Postgres data grant is
+        # read-only (USER/GROUP -> SELECT) via the post-hook.
+        - group_name: SH_LKB_RISK_DEVELOPER
+          level: CAN_MANAGE
       # custom_tags: CONFIRMED NO-OP through CLI v1.5.0 (validates/deploys but not
       # applied; get-project returns custom_tags: null). Kept as intent. For real
       # cost attribution use a budget/usage policy + budget_policy_id.

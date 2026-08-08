@@ -165,12 +165,31 @@ def extract_projects(config: dict) -> list[dict]:
                 if bid:
                     my_endpoints.append((ekey, bid, str(ep.get("endpoint_id", "primary"))))
 
-        # catalogs whose branch references THIS project
+        # catalogs whose branch references THIS project. Also collect the distinct
+        # Postgres databases this project exposes (needed for per-database data grants).
         my_catalogs = []
+        my_databases: list[str] = []
         for ckey, c in catalogs.items():
             if _project_key_for_ref(str(c.get("branch", ""))) == proj_key:
                 cat_id = resolve_vars(str(c["catalog_id"]), config)
                 my_catalogs.append((ckey, cat_id))
+                db = c.get("postgres_database")
+                if db and db not in my_databases:
+                    my_databases.append(str(db))
+
+        # permissions block on THIS project -> data-plane grant targets. Map the DABs ACL
+        # principal fields to (identity, identity_type):
+        #   service_principal_name -> SERVICE_PRINCIPAL (identity = app id UUID)
+        #   user_name              -> USER              (identity = email)
+        #   group_name             -> GROUP             (identity = group display name)
+        my_principals: list[tuple[str, str]] = []
+        for perm in (proj.get("permissions") or []):
+            if perm.get("service_principal_name"):
+                my_principals.append((str(perm["service_principal_name"]), "SERVICE_PRINCIPAL"))
+            elif perm.get("user_name"):
+                my_principals.append((str(perm["user_name"]), "USER"))
+            elif perm.get("group_name"):
+                my_principals.append((str(perm["group_name"]), "GROUP"))
 
         items.append({
             "proj_key": proj_key,
@@ -179,6 +198,8 @@ def extract_projects(config: dict) -> list[dict]:
             "branches": my_branches,
             "endpoints": my_endpoints,
             "catalogs": my_catalogs,
+            "databases": my_databases,
+            "principals": my_principals,
         })
     return items
 
@@ -339,6 +360,193 @@ def grant_catalog_privileges(cli: str, catalog_id: str, group: str, profile: str
         log(f"Granted ALL_PRIVILEGES + MANAGE on catalog '{catalog_id}' to group '{group}'.")
 
 
+def grant_catalog_read(cli: str, catalog_id: str, principal: str, profile: str | None, dry_run: bool = False) -> None:
+    """
+    Grant a principal (e.g. a developer) USE_CATALOG + SELECT on a UC catalog — read +
+    view tables, no manage/write-DDL. Used for the dev developer grant (dev target only).
+    """
+    changes = {"changes": [{"principal": principal, "add": ["USE_CATALOG", "SELECT"]}]}
+    cmd = [cli, "grants", "update", "catalog", catalog_id, "--json", json.dumps(changes)]
+    if profile:
+        cmd += ["-p", profile]
+    if dry_run:
+        log(f"DRY-RUN would grant USE_CATALOG + SELECT on catalog '{catalog_id}' to '{principal}'.")
+        return
+    proc = run(cmd, check=False, capture=True)
+    print(proc.stdout, end="")
+    if proc.returncode != 0:
+        log(f"WARNING: could not grant read on catalog '{catalog_id}' to '{principal}' "
+            f"(exit {proc.returncode}). Grant it manually or re-run --phase post.")
+    else:
+        log(f"Granted USE_CATALOG + SELECT on catalog '{catalog_id}' to '{principal}'.")
+
+
+# Data-plane privilege policy: what each identity TYPE gets on the Postgres tables.
+#   SERVICE_PRINCIPAL = runtime writer -> read+write
+#   USER / GROUP      = human inspector -> read-only
+# (Central so the policy lives in one place; change here to re-tune.)
+def privileges_for(identity_type: str) -> str:
+    return "SELECT,INSERT,UPDATE,DELETE" if identity_type == "SERVICE_PRINCIPAL" else "SELECT"
+
+
+def current_identity(cli: str, profile: str | None) -> str:
+    """
+    Return the authenticated caller's identity (for an SP this is its application id).
+    Used to SKIP data-plane grants for the deployer: the pre-hook runs AS the SP that
+    created the instance, which is the project OWNER and already a databricks_superuser
+    member — so granting it data access is redundant (and create_role on it can error).
+    """
+    cmd = [cli, "current-user", "me", "-o", "json"]
+    if profile:
+        cmd += ["-p", profile]
+    proc = run(cmd, check=False, capture=True)
+    try:
+        return str(json.loads(proc.stdout).get("userName", "")).strip()
+    except json.JSONDecodeError:
+        return ""
+
+
+def grant_data_role(
+    cli: str, target: str, project_id: str, database: str,
+    identity: str, identity_type: str, profile: str | None, dry_run: bool = False,
+) -> bool:
+    """
+    Run the shared `setup_data_role` bundle job to grant ONE identity direct-connection
+    Postgres access (role + table DML) on ONE database. This is DATA-PLANE work (psycopg
+    over OAuth), so it must run as a bundle job in the workspace — the CLI/pre-hook cannot
+    execute Postgres SQL itself. Privileges are derived from the identity type.
+
+    Returns True on success, False on failure. Unlike the (best-effort) autoscale/admin
+    grants, data-plane grant failures are treated as FATAL by the caller: a silently
+    dropped grant means an identity has no access, which must not pass as green.
+    """
+    # NOTE: `bundle run --params` is COMMA-separated key=value pairs, so a value cannot
+    # itself contain commas (e.g. "SELECT,INSERT,..." would be parsed as extra keys and
+    # rejected: "INSERT must be formatted as key=value"). Join privileges with '+' here;
+    # the notebook splits on either '+' or ','.
+    privs = privileges_for(identity_type).replace(",", "+")
+    params = (f"project_id={project_id},database={database},identity={identity},"
+              f"identity_type={identity_type},privileges={privs}")
+    cmd = [cli, "bundle", "run", "setup_data_role", "-t", target, "--params", params]
+    if profile:
+        cmd += ["-p", profile]
+    if dry_run:
+        log(f"DRY-RUN would grant {identity_type} '{identity}' [{privs}] on "
+            f"{project_id}/{database} via setup_data_role.")
+        return True
+    proc = run(cmd, check=False, capture=True)
+    print(proc.stdout, end="")
+    if proc.returncode != 0:
+        log(f"ERROR: setup_data_role failed for {identity_type} '{identity}' on "
+            f"{project_id}/{database} (exit {proc.returncode}).")
+        return False
+    log(f"Granted {identity_type} '{identity}' [{privs}] on {project_id}/{database}.")
+    return True
+
+
+def _pg_cli_json(cli: str, args: list[str], profile: str | None) -> tuple[int, dict | list | None]:
+    """Run a `databricks postgres ...` CLI subcommand and parse its JSON output."""
+    cmd = [cli, "postgres", *args, "-o", "json"]
+    if profile:
+        cmd += ["-p", profile]
+    proc = run(cmd, check=False, capture=True)
+    try:
+        return proc.returncode, json.loads(proc.stdout)
+    except (json.JSONDecodeError, TypeError):
+        return proc.returncode, None
+
+
+def grant_admin_superuser(
+    cli: str, project_id: str, admin_group: str, profile: str | None, dry_run: bool = False,
+) -> bool:
+    """
+    Grant the admin GROUP `databricks_superuser` via the CONTROL-PLANE role API — NOT raw
+    SQL. `databricks_superuser` is NOLOGIN and no customer-connectable identity holds ADMIN
+    OPTION on it, so `GRANT databricks_superuser TO ...` from a psql session (even as the
+    owner) fails with InsufficientPrivilege. The postgres role API grants membership using
+    an internally-privileged role, authorized by the SP's PROJECT ownership.
+
+    Two steps: ensure the group's OAuth role exists (create-role; no-op if present), then
+    update-role with membership_roles=["DATABRICKS_SUPERUSER"]. NOTE: membership_roles
+    REPLACES the list (not merge) — we send the full intended set. This is a
+    project/branch-level grant (not per-database). Returns True on success.
+    """
+    parent = f"projects/{project_id}/branches/production"
+    if dry_run:
+        log(f"DRY-RUN would grant databricks_superuser to group '{admin_group}' on "
+            f"{project_id} via the postgres role API (create-role + update-role).")
+        return True
+
+    # Step 1: ensure the GROUP OAuth role exists. Reuse a deterministic role-id so we can
+    # address it; "already exists" is a benign no-op (the SQL path or a prior run made it).
+    role_id = "grp-" + re.sub(r"[^a-z0-9-]", "-", admin_group.lower())
+    create_args = ["create-role", parent, "--role-id", role_id, "--json",
+                   json.dumps({"spec": {"identity_type": "GROUP", "postgres_role": admin_group,
+                                        "auth_method": "LAKEBASE_OAUTH_V1"}})]
+    rc, _ = _pg_cli_json(cli, create_args, profile)
+    # rc != 0 with "already exists" is fine; find the actual role resource by postgres_role
+    # (its name may be this role_id OR a rol-xxxx from an earlier SQL create).
+    rc_list, roles = _pg_cli_json(cli, ["list-roles", parent], profile)
+    role_name = None
+    for r in (roles or []):
+        rn = r.get("name", "")
+        rc_g, detail = _pg_cli_json(cli, ["get-role", rn], profile)
+        if detail and detail.get("status", {}).get("postgres_role") == admin_group:
+            role_name = rn
+            break
+    if not role_name:
+        log(f"ERROR: could not locate the postgres role for group '{admin_group}' after create.")
+        return False
+
+    # Step 2: grant DATABRICKS_SUPERUSER membership AND set the role ATTRIBUTES. Role
+    # attributes (createdb/createrole/bypassrls) are NOT inherited through membership in
+    # Postgres — they must be set directly on the role. So the static SH admin group needs
+    # both: superuser membership (for pg_read_all_data/pg_write_all_data etc.) + these
+    # attributes (to actually CREATE DATABASE / CREATE ROLE / bypass RLS). One update-role
+    # call with a combined mask. membership_roles REPLACES the list (send the full set).
+    rc_u, updated = _pg_cli_json(
+        cli, ["update-role", role_name, "spec.membership_roles,spec.attributes",
+              "--json", json.dumps({"spec": {
+                  "membership_roles": ["DATABRICKS_SUPERUSER"],
+                  "attributes": {"createdb": True, "createrole": True, "bypassrls": True},
+              }})],
+        profile)
+    if rc_u != 0 or not updated:
+        log(f"ERROR: update-role failed granting databricks_superuser + attributes to '{admin_group}' on {project_id}.")
+        return False
+    log(f"Granted databricks_superuser + createdb/createrole/bypassrls to group '{admin_group}' on {project_id} (via role API).")
+    return True
+
+
+def grant_dataapi_role(
+    cli: str, target: str, project_id: str, database: str,
+    identity: str, profile: str | None, dry_run: bool = False,
+) -> bool:
+    """
+    Run `setup_dataapi_role` to wire ONE service principal into the Data API path:
+    GRANT <sp> TO authenticator + table/sequence DML across all schemas. The SP id is
+    passed directly (from the permissions block) — no secret scope. PREREQ: "Enable Data
+    API" must be clicked on the instance first (creates the `authenticator` role).
+    Returns True on success. Only meaningful for SERVICE_PRINCIPAL identities.
+    """
+    params = f"project_id={project_id},database={database},identity={identity}"
+    cmd = [cli, "bundle", "run", "setup_dataapi_role", "-t", target, "--params", params]
+    if profile:
+        cmd += ["-p", profile]
+    if dry_run:
+        log(f"DRY-RUN would wire SP '{identity}' into Data API (authenticator) on "
+            f"{project_id}/{database} via setup_dataapi_role.")
+        return True
+    proc = run(cmd, check=False, capture=True)
+    print(proc.stdout, end="")
+    if proc.returncode != 0:
+        log(f"ERROR: setup_dataapi_role failed for SP '{identity}' on {project_id}/{database} "
+            f"(exit {proc.returncode}). Did you click 'Enable Data API' on the instance first?")
+        return False
+    log(f"Wired SP '{identity}' into Data API (authenticator) on {project_id}/{database}.")
+    return True
+
+
 # --------------------------------------------------------------------------- #
 # Step 2 — bind
 # --------------------------------------------------------------------------- #
@@ -429,6 +637,22 @@ def main() -> int:
                              "ALL_PRIVILEGES + MANAGE on each UC catalog (--phase post; owner NOT "
                              "transferred — SP/creator stays owner). Pass '' to skip. "
                              "Default SH_ENTERPRISE_ADMIN.")
+    parser.add_argument("--developer", default="",
+                        help="Developer identity (email) granted USE_CATALOG + SELECT on each UC "
+                             "catalog (--phase post). Intended DEV-ONLY — the workflow passes this "
+                             "only when target=dev. Empty = skip. (Postgres data access for devs "
+                             "comes from the permissions block via --grant-data-access.)")
+    parser.add_argument("--grant-data-access", action="store_true",
+                        help="(--phase post) Derive Postgres data-plane grants from each project's "
+                             "`permissions:` block and run the setup_data_role job per (principal, "
+                             "database): SERVICE_PRINCIPAL -> read+write, USER/GROUP -> read-only. "
+                             "Off by default (opt-in), since it opens a Postgres connection per grant.")
+    parser.add_argument("--grant-dataapi", action="store_true",
+                        help="(--phase post) Wire each project's SERVICE_PRINCIPAL(s) from the "
+                             "`permissions:` block into the Data API (GRANT <sp> TO authenticator) "
+                             "via setup_dataapi_role. PREREQ: 'Enable Data API' clicked on the "
+                             "instance first. Combine with --only <project_id> to do just ONE "
+                             "project (the normal path — Enable-Data-API is manual per-instance).")
     parser.add_argument("--dry-run", action="store_true",
                         help="Discover + print the planned actions per project, but do NOT create, bind, "
                              "or update anything. Safe to run first.")
@@ -457,6 +681,10 @@ def main() -> int:
 
     # ---------------- PHASE: post (autoscale + scale-to-zero + admin grants, AFTER deploy) ----
     if args.phase == "post":
+        data_grant_failures: list[str] = []  # data-plane grant failures are FATAL (collected, raised at end)
+        # The deployer identity (= instance owner / databricks_superuser) is skipped by the
+        # data grants. Resolve it ONCE (a CLI call), only when a grant flag needs it.
+        owner = current_identity(args.cli, args.profile) if (args.grant_data_access or args.grant_dataapi) else ""
         for item in items:
             project_id = item["project_id"]
             # Set the window on each declared endpoint; if none declared, default to
@@ -471,9 +699,69 @@ def main() -> int:
             # owner concept there), and ALL_PRIVILEGES + MANAGE on each of the project's
             # UC catalogs WITHOUT transferring ownership (SP/creator stays owner).
             if args.admin_group:
+                # Control plane: CAN_MANAGE on the project.
                 grant_project_admin(args.cli, project_id, args.admin_group, args.profile, args.dry_run)
+                # UC plane: ALL_PRIVILEGES + MANAGE on each catalog.
                 for _ckey, cat_id in item["catalogs"]:
                     grant_catalog_privileges(args.cli, cat_id, args.admin_group, args.profile, args.dry_run)
+                # Data plane: databricks_superuser for the admin group (static SH admin role
+                # gets full Postgres control). Project/branch-level (not per-DB), via the
+                # role API. Fatal on failure like the other data grants.
+                ok = grant_admin_superuser(args.cli, project_id, args.admin_group,
+                                           args.profile, args.dry_run)
+                if not ok:
+                    data_grant_failures.append(f"superuser: {args.admin_group} on {project_id}")
+            # Developer (dev only — workflow passes --developer only when target=dev):
+            # read + view tables on each catalog. Postgres data access for devs comes from
+            # the permissions block via --grant-data-access, not here.
+            if args.developer:
+                for _ckey, cat_id in item["catalogs"]:
+                    grant_catalog_read(args.cli, cat_id, args.developer, args.profile, args.dry_run)
+            # Postgres DATA-PLANE grants derived from the project's permissions block
+            # (opt-in via --grant-data-access). One setup_data_role run per (principal,
+            # database): SP -> read+write, USER/GROUP -> read-only.
+            if args.grant_data_access:
+                # The deployer (pre-hook's own identity) OWNS the instance and is already
+                # a databricks_superuser member — skip it (redundant + create_role errors).
+                if not item["principals"]:
+                    log(f"No permissions block on '{project_id}' — no data grants to derive.")
+                elif not item["databases"]:
+                    log(f"No postgres databases discovered for '{project_id}' — skipping data grants.")
+                for identity, id_type in item["principals"]:
+                    if owner and identity == owner:
+                        log(f"Skipping data grant for '{identity}' — it is the deployer/owner "
+                            f"(already databricks_superuser).")
+                        continue
+                    for db in item["databases"]:
+                        ok = grant_data_role(args.cli, args.target, project_id, db,
+                                             identity, id_type, args.profile, args.dry_run)
+                        if not ok:
+                            data_grant_failures.append(f"{identity} on {project_id}/{db}")
+
+            # Data API wiring (opt-in): GRANT <sp> TO authenticator for each SERVICE_PRINCIPAL
+            # in the permissions block. Use --only <project_id> to target the ONE project whose
+            # Data API was just enabled. Only SPs (users don't get wired to authenticator);
+            # deployer/owner skipped (its authenticator grant would 42501 anyway).
+            if args.grant_dataapi:
+                for identity, id_type in item["principals"]:
+                    if id_type != "SERVICE_PRINCIPAL":
+                        continue
+                    if owner and identity == owner:
+                        log(f"Skipping Data API wiring for '{identity}' — deployer/owner.")
+                        continue
+                    for db in item["databases"]:
+                        ok = grant_dataapi_role(args.cli, args.target, project_id, db,
+                                                identity, args.profile, args.dry_run)
+                        if not ok:
+                            data_grant_failures.append(f"authenticator: {identity} on {project_id}/{db}")
+        # Data-plane grant failures are FATAL: a dropped grant means an identity silently
+        # has no access, which must NOT pass as green (this masked a real bug once).
+        if data_grant_failures:
+            raise SystemExit(
+                "ERROR: setup_data_role failed for: " + "; ".join(data_grant_failures)
+                + ". Data-plane grants are required — fix the cause and re-run --phase post "
+                  "--grant-data-access."
+            )
         log("Post-hook complete (autoscale + scale-to-zero + admin grants set).")
         return 0
 
@@ -483,19 +771,21 @@ def main() -> int:
             f"(branches={len(item['branches'])}, endpoints={len(item['endpoints'])}, "
             f"catalogs={len(item['catalogs'])}) ---")
 
-        # The pre-hook is a ONE-TIME cutover per instance. If the instance already
-        # exists it is created + bound (DAB-managed) — nothing to do; deploy reconciles.
+        # Create the instance ONLY if it doesn't exist (legacy-provisioned -> unlocks
+        # Dual Networking). If it already exists, skip the create — but STILL bind below.
         if instance_exists(args.cli, item["project_id"], args.profile):
-            log(f"Instance '{item['project_id']}' already exists — bound & DAB-managed. Pre-hook no-op.")
-            continue
+            log(f"Instance '{item['project_id']}' already exists — skipping create; ensuring bind.")
+        else:
+            cap_var = config.get("variables", {}).get("capacity", {})
+            capacity = cap_var.get("value") or cap_var.get("default") or "CU_1"
+            create_legacy_instance(args.cli, item["project_id"], capacity, args.profile,
+                                   item.get("pg_version"), args.dry_run)
 
-        # First-time cutover: create legacy-provisioned (unlocks Dual Networking), then bind.
-        cap_var = config.get("variables", {}).get("capacity", {})
-        capacity = cap_var.get("value") or cap_var.get("default") or "CU_1"
-        create_legacy_instance(args.cli, item["project_id"], capacity, args.profile,
-                               item.get("pg_version"), args.dry_run)
-
-        log("Binding autoscaling resource keys to the newly-created instance...")
+        # ALWAYS bind (idempotent — "already bound" is a safe no-op). This is the fix for
+        # the "instance exists but is NOT bound in THIS bundle state" case (e.g. created
+        # manually, on a different runner, or in a fresh CI state): without binding here,
+        # `bundle deploy` would try to CREATE it and fail with "project slug already exists".
+        log("Ensuring autoscaling resource keys are bound...")
         bind_item(args.cli, item, args.target, args.profile, args.dry_run)
 
     log("Pre-hook complete. The pipeline can now run `databricks bundle deploy`.")

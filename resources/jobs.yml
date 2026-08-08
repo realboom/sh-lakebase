@@ -19,23 +19,48 @@ resources:
   jobs:
     setup_dataapi_role:
       name: "[SH Lakebase] Setup Data API role (grant SP)"
-      # No defaults on identity params — the notebook fails fast if any are blank,
-      # so a misconfigured run can never grant against the wrong instance/database.
+      # No defaults on project/database — the notebook fails fast if blank.
       parameters:
         - name: project_id
           default: ""
         - name: database
           default: ""
+        # PRIMARY: SP application id, passed directly (sourced from the project's
+        # permissions block by the pre-hook — no secret scope needed).
+        - name: identity
+          default: ""
+        # LEGACY FALLBACK (original repo): secret-scope source for the SP id. Used only
+        # if `identity` is blank. Kept for backward compat.
         - name: secret_scope
           default: ""
-        # Vault key name holding the value stream's SP client id, derived upstream as
-        # sp-<value_stream>-dbrk-client-id. Defaults to the legacy fixed key if omitted.
         - name: client_id_key
           default: sp_client_id
       tasks:
         - task_key: setup_role
           notebook_task:
             notebook_path: ../src/setup_dataapi_role.py
+
+    # Grant an identity DIRECT-CONNECTION Postgres data access (role + table DML), derived
+    # from a project's `permissions:` block by the post-hook. NOT the Data API path — does
+    # not grant TO authenticator, so needs no "Enable Data API". Post-hook passes privileges
+    # per identity type (SP -> RW, USER -> RO).
+    setup_data_role:
+      name: "[SH Lakebase] Setup data role (direct-connection grant)"
+      parameters:
+        - name: project_id
+          default: ""
+        - name: database
+          default: ""
+        - name: identity          # SP application id (UUID) or user email
+          default: ""
+        - name: identity_type     # SERVICE_PRINCIPAL | USER | GROUP
+          default: ""
+        - name: privileges        # comma-sep: SELECT[,INSERT,UPDATE,DELETE]
+          default: SELECT
+      tasks:
+        - task_key: setup_data_role
+          notebook_task:
+            notebook_path: ../src/setup_data_role.py
 
     setup_synced_table_grants:
       name: "[SH Lakebase] Grant read on synced-table schemas"

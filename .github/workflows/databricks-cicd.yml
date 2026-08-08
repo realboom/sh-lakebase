@@ -8,10 +8,17 @@ name: Databricks DABs CI/CD
 #   - Manual dispatch -> onboard / update a Lakebase instance, with a CONDITIONAL
 #     "create new provisioned instance" step (see the onboard-lakebase job).
 #
-# Auth: OAuth M2M (service principal). Per-environment GitHub Environments hold creds:
-#   vars:    DATABRICKS_HOST
+# Auth: Entra ID (Azure AD) service principal — azure-client-secret. Per-environment
+# GitHub Environments hold creds:
+#   vars:    DATABRICKS_HOST, ARM_TENANT_ID
 #   secrets: DATABRICKS_CLIENT_ID, DATABRICKS_CLIENT_SECRET
-# Create the SPs with scripts/bootstrap_identity.sh and put their client id/secret here.
+#            (these hold the ENTRA SP's app-registration client id + secret — the
+#             CI/CD service principal's values).
+# NOTE ON NAMING: the GitHub SECRET names are DATABRICKS_CLIENT_ID/SECRET (matching the
+# client's convention), but they are mapped into ARM_CLIENT_ID / ARM_CLIENT_SECRET at the
+# env/profile level on purpose. The Databricks CLI auto-detects auth from env vars, and
+# `DATABRICKS_CLIENT_ID`/`SECRET` as *env vars* would select OAUTH-M2M (wrong for an Entra
+# SP). Exposing them as ARM_* selects azure-client-secret (the Entra/MSAL path).
 
 on:
   pull_request:
@@ -29,9 +36,17 @@ on:
         options: [dev, prod]
         default: dev
       run_data_api_grants:
-        description: "Run Data API role grants for all projects/databases? (check ONLY after you have manually clicked 'Enable Data API' on each instance in the UI — that step creates the authenticator role the grants need)"
+        description: "Enable Data API grants? (check ONLY after you have manually clicked 'Enable Data API' on the target instance in the UI — that step creates the authenticator role the grants need)"
         type: boolean
         default: false
+      data_api_project_id:
+        description: "Data API: target ONE project_id (e.g. dev-sh-lkb-risk). Leave BLANK to grant every project in the bundle. Databases + schemas are DERIVED (from postgres_catalogs + the live DB) — you don't enter them."
+        type: string
+        default: ""
+      # NOTE (2026-08-05): per-developer grants are currently DISABLED — only the
+      # SH_ENTERPRISE_ADMIN group is granted (universal). Developer UC/superuser
+      # access is deferred pending a client conversation on the access model.
+      # vars.DATABRICKS_EMAIL_DOMAIN is unused until then.
 
 permissions:
   contents: read
@@ -42,10 +57,13 @@ jobs:
     if: github.event_name == 'pull_request'
     runs-on: self-hosted
     environment: dev
+    # Entra SP auth: map the DATABRICKS_CLIENT_* secrets into ARM_* env vars so the CLI
+    # selects azure-client-secret (not oauth-m2m). See the naming note in the header.
     env:
       DATABRICKS_HOST: ${{ vars.DATABRICKS_HOST }}
-      DATABRICKS_CLIENT_ID: ${{ secrets.DATABRICKS_CLIENT_ID }}
-      DATABRICKS_CLIENT_SECRET: ${{ secrets.DATABRICKS_CLIENT_SECRET }}
+      ARM_CLIENT_ID: ${{ secrets.DATABRICKS_CLIENT_ID }}
+      ARM_CLIENT_SECRET: ${{ secrets.DATABRICKS_CLIENT_SECRET }}
+      ARM_TENANT_ID: ${{ vars.ARM_TENANT_ID }}
     steps:
       - uses: actions/checkout@v6
       - uses: databricks/setup-cli@main
@@ -62,8 +80,9 @@ jobs:
   #   concurrency: deploy-prod
   #   env:
   #     DATABRICKS_HOST: ${{ vars.DATABRICKS_HOST }}
-  #     DATABRICKS_CLIENT_ID: ${{ secrets.DATABRICKS_CLIENT_ID }}
-  #     DATABRICKS_CLIENT_SECRET: ${{ secrets.DATABRICKS_CLIENT_SECRET }}
+  #     ARM_CLIENT_ID: ${{ secrets.DATABRICKS_CLIENT_ID }}
+  #     ARM_CLIENT_SECRET: ${{ secrets.DATABRICKS_CLIENT_SECRET }}
+  #     ARM_TENANT_ID: ${{ vars.ARM_TENANT_ID }}
   #   steps:
   #     - uses: actions/checkout@v5
   #     - uses: databricks/setup-cli@main
@@ -89,25 +108,38 @@ jobs:
       - uses: databricks/setup-cli@main
 
       # --- Auth: write the `gh-actions` CLI profile ---
-      # Every step below authenticates with `--profile gh-actions`. Only the auth
-      # LINES below differ between environments — the profile NAME stays `gh-actions`
-      # so nothing downstream changes:
-      #   • CLIENT (real): Managed Identity / MSAL — replace the client_id/secret
-      #     lines with:   azure_client_id = ${{ vars.ARM_CLIENT_ID }}
-      #                    azure_use_msi   = true
-      #   • THIS (test):  OAuth M2M service principal (client id + secret), since
-      #     MSAL/managed-identity can't be reproduced on this workspace's tenant.
-      - name: Set up Databricks CLI authentication (OAuth M2M service principal)
+      # Every step below authenticates with `--profile gh-actions`. Entra ID (Azure AD)
+      # service principal via azure-client-secret. The profile NAME stays `gh-actions`
+      # so nothing downstream changes.
+      #   • This is the Entra ID (Azure AD) app-registration service principal for CI/CD.
+      #   • To swap to Managed Identity later, replace azure_client_secret with
+      #     `azure_use_msi = true` (keep azure_client_id + azure_tenant_id).
+      - name: Set up Databricks CLI authentication (Entra service principal)
         shell: bash
         run: |
+          # Fail fast if any credential is missing/empty. Without this guard a blank
+          # client_id lets the CLI fall back to a cached U2M (human) token on the
+          # self-hosted runner — which silently creates resources AS the runner's user
+          # instead of the SP (this bit us: devtest3 got creator=clint.whetten).
+          if [ -z "${{ secrets.DATABRICKS_CLIENT_ID }}" ] || [ -z "${{ secrets.DATABRICKS_CLIENT_SECRET }}" ] || [ -z "${{ vars.ARM_TENANT_ID }}" ]; then
+            echo "::error::DATABRICKS_CLIENT_ID / DATABRICKS_CLIENT_SECRET (secrets) and ARM_TENANT_ID (var) must all be set in the '${{ inputs.target }}' GitHub Environment."
+            exit 1
+          fi
           mkdir -p ~/.databricks
+          # SECRET names are DATABRICKS_CLIENT_ID/SECRET (client convention) but they carry
+          # the ENTRA SP's app-registration id/secret and are written into the azure_*
+          # profile keys -> auth_type=azure-client-secret (the Entra/MSAL path).
           cat > ~/.databrickscfg <<EOF
           [gh-actions]
-          host          = ${{ vars.DATABRICKS_HOST }}
-          client_id     = ${{ vars.DATABRICKS_CLIENT_ID }}
-          client_secret = ${{ secrets.DATABRICKS_CLIENT_SECRET }}
+          host              = ${{ vars.DATABRICKS_HOST }}
+          azure_client_id     = ${{ secrets.DATABRICKS_CLIENT_ID }}
+          azure_client_secret = ${{ secrets.DATABRICKS_CLIENT_SECRET }}
+          azure_tenant_id     = ${{ vars.ARM_TENANT_ID }}
+          auth_type         = azure-client-secret
           EOF
-          # (Do NOT `cat` the file — client_secret would print to the CI log.)
+          # (Do NOT `cat` the file — azure_client_secret would print to the CI log.)
+          # auth_type=azure-client-secret pins the auth source: the CLI will NOT fall
+          # back to any cached user token if the SP creds are wrong — it errors instead.
 
       # --- Pre-hook: automated legacy-provision -> bind cutover (all projects) ---
       # Replaces the old input-driven Create + Bind steps. The Python pre-hook reads
@@ -121,12 +153,21 @@ jobs:
       # Use --only <project_id|key> to cut over a single value stream at a time.
       - name: Lakebase pre-hook (create-legacy + bind)
         run: |
-          # Sanity-check the profile resolves (host comes from the gh-actions profile,
-          # not an env var). Fails fast with a clear message if auth didn't get written.
-          if ! databricks current-user me --profile gh-actions >/dev/null 2>&1; then
+          # Sanity-check the profile resolves AND that it authenticated as the SP —
+          # not as a cached human user token. For a service principal, current-user
+          # `userName` is the SP application (client) id; for a human it's an email.
+          # We assert userName == client_id so a fallback-to-human auth fails loudly
+          # instead of silently creating resources under a real user's name.
+          ME_USERNAME="$(databricks current-user me --profile gh-actions -o json | python3 -c 'import sys,json; print(json.load(sys.stdin).get("userName",""))')"
+          if [ -z "$ME_USERNAME" ]; then
             echo "::error::gh-actions profile did not authenticate. Check DATABRICKS_HOST / client_id / client_secret (or MSAL config) in the '${{ inputs.target }}' GitHub Environment."
             exit 1
           fi
+          if [ "$ME_USERNAME" != "${{ secrets.DATABRICKS_CLIENT_ID }}" ]; then
+            echo "::error::gh-actions authenticated as '$ME_USERNAME', not the expected service principal (client_id). Refusing to run as a fallback/human identity."
+            exit 1
+          fi
+          echo "[auth] verified running as service principal $ME_USERNAME"
           python3 scripts/lakebase_prehook.py --target "${{ inputs.target }}" --profile gh-actions
 
       # --- ALWAYS runs: reconciles the bundle (catalogs, synced tables, jobs) ---
@@ -140,66 +181,45 @@ jobs:
       # native `databricks postgres update-endpoint` CLI (no token-mint/curl needed).
       # Runs for ALL projects in the bundle, on the production/primary endpoint (or any
       # declared postgres_endpoints). Non-fatal per endpoint so one failure won't abort.
-      - name: Set autoscale window (post-deploy)
+      - name: Set autoscale window + admin grants (post-deploy)
         run: |
+          # Admin group only. Per-developer UC grants are intentionally NOT wired here
+          # (2026-08-05): a developer may not — and often should not — have access to
+          # every value stream's UC. Deferred pending a client conversation on the
+          # developer-access model. The prehook still accepts --developer (defaults to
+          # empty = skip); re-add it here once that model is agreed.
+          #
+          # --grant-data-access: derive Postgres data-plane grants from each project's
+          # permissions: block and run setup_data_role per (principal x database) —
+          # SERVICE_PRINCIPAL -> read+write, USER/GROUP -> read-only. The deployer/owner
+          # (this SP) is auto-skipped (already databricks_superuser). Idempotent.
           python3 scripts/lakebase_prehook.py --phase post --target "${{ inputs.target }}" \
             --min-cu 0.5 --max-cu 2.0 --suspend-timeout 300s \
-            --admin-group SH_ENTERPRISE_ADMIN --profile gh-actions
+            --admin-group SH_ENTERPRISE_ADMIN --grant-data-access --profile gh-actions
 
-      # --- Grant the Data API SP its Postgres role (all projects x all databases) ---
+      # NOTE: admin-group databricks_superuser (Postgres data-plane) is now granted by the
+      # post-deploy step above (prehook --admin-group -> grant_admin_superuser, via the
+      # postgres role API). The old standalone superuser step + setup_lakebase_superuser
+      # job were removed — raw SQL GRANT databricks_superuser can't work from a customer
+      # session (no ADMIN OPTION), so the role-API path replaced them.
+
+      # --- Grant the Data API SP its Postgres role -------------------------------
       # Gated on run_data_api_grants because it has a MANUAL prerequisite: you must
-      # click "Enable Data API" on each instance in the UI first — that creates the
+      # click "Enable Data API" on the instance in the UI first — that creates the
       # `authenticator` role the grant depends on (no API to enable it).
-      # No instance_name/database inputs: we enumerate every (project_id, database)
-      # pair from the bundle (postgres_catalogs.postgres_database across all
-      # resources/lakebase_*.yml) and run the shared setup_dataapi_role job per pair.
-      # The notebook stays "grant one project + one database"; the loop lives here.
+      #
+      # The pre-hook (--grant-dataapi) wires each project's SERVICE_PRINCIPAL(s) from the
+      # `permissions:` block into the Data API (GRANT <sp> TO authenticator + DML), passing
+      # the SP id directly — no secret scope. TARGETING: because Enable-Data-API is manual
+      # and per-instance, pass data_api_project_id to do JUST that project via --only.
+      # Leave it blank to process every project in the bundle (only safe once Data API is
+      # enabled on all of them).
       - name: Grant Data API role
         if: ${{ inputs.run_data_api_grants }}
         run: |
-          # Scope + client-id key are DERIVED (developer provides neither):
-          #   scope          = kv-sh-ent-dpa-<target>              (same for every stream, per env)
-          #   client_id_key  = sp-<value_stream>-dbrk-client-id    (per stream, from the value_stream tag)
-          SCOPE="kv-sh-ent-dpa-${{ inputs.target }}"
-          # Enumerate (project_id | database | client_id_key) from the resolved bundle.
-          databricks bundle validate -t "${{ inputs.target }}" -o json --profile gh-actions > /tmp/bundle.json 2>/dev/null || true
-          mapfile -t ROWS < <(python3 - <<'PY'
-          import json, re
-          cfg = json.load(open("/tmp/bundle.json"))
-          variables = cfg.get("variables", {})
-          def rv(s):
-              return re.sub(r"\$\{var\.([A-Za-z_]\w*)\}",
-                            lambda m: str(variables.get(m.group(1),{}).get("value",
-                                          variables.get(m.group(1),{}).get("default",""))), s)
-          res = cfg.get("resources", {})
-          # project key -> (project_id, value_stream from custom_tags)
-          projects = {}
-          for k, v in res.get("postgres_projects", {}).items():
-              vs = ""
-              for t in (v.get("custom_tags") or []):
-                  if t.get("key") == "value_stream":
-                      vs = str(t.get("value", "")); break
-              projects[k] = (rv(str(v["project_id"])), vs)
-          seen = set()
-          for c in res.get("postgres_catalogs", {}).values():
-              pk = re.search(r"postgres_projects\.([^.}]+)\.", str(c.get("branch", "")))
-              db = c.get("postgres_database")
-              if pk and db and pk.group(1) in projects:
-                  pid, vs = projects[pk.group(1)]
-                  if not vs:
-                      continue  # no value_stream tag -> can't derive the key; skip
-                  key = f"sp-{vs}-dbrk-client-id"
-                  row = (pid, db, key)
-                  if row not in seen:
-                      seen.add(row); print(f"{pid}|{db}|{key}")
-          PY
-          )
-          if [ ${#ROWS[@]} -eq 0 ]; then
-            echo "::warning::no (project,database,value_stream) rows found — nothing to grant."
+          ONLY_ARG=""
+          if [ -n "${{ inputs.data_api_project_id }}" ]; then
+            ONLY_ARG="--only ${{ inputs.data_api_project_id }}"
           fi
-          for row in "${ROWS[@]}"; do
-            INST="${row%%|*}"; REST="${row#*|}"; DB="${REST%%|*}"; KEY="${REST##*|}"
-            echo "Granting Data API role for project_id=$INST database=$DB scope=$SCOPE client_id_key=$KEY"
-            databricks bundle run setup_dataapi_role -t "${{ inputs.target }}" \
-              --params "project_id=$INST,database=$DB,secret_scope=$SCOPE,client_id_key=$KEY" --profile gh-actions
-          done
+          python3 scripts/lakebase_prehook.py --phase post --target "${{ inputs.target }}" \
+            --grant-dataapi --admin-group '' --suspend-timeout '' $ONLY_ARG --profile gh-actions
