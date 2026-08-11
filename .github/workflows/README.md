@@ -76,8 +76,8 @@ in `databricks.yml`. The catalog is composed per-env: `${environment}_sh_lakebas
 
 ## Notes / gotchas
 - **Runners:** jobs use `runs-on: self-hosted`. If self-hosted runners are disabled, this
-  workflow is a reference — run the equivalent steps locally (see the onboarding runbook in
-  the SelectHealth Obsidian folder).
+  workflow is a reference — run the equivalent steps locally (see your project's
+  onboarding runbook).
 - **Never `bundle destroy`** a shared bundle — it deletes instances + data. Delete a single
   instance with `databricks database delete-database-instance <name>`.
 - **Enabling the Data API has NO API/CLI/DABs path** — it is a manual UI click

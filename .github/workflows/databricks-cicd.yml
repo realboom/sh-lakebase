@@ -176,12 +176,12 @@ jobs:
       - name: Deploy
         run: databricks bundle deploy -t "${{ inputs.target }}" --auto-approve --profile gh-actions
 
-      # --- POST-deploy: set the 0.5->2 CU autoscale window on each project's endpoint ---
-      # DABs can't set this on an auto-created primary, so the pre-hook does it via the
-      # native `databricks postgres update-endpoint` CLI (no token-mint/curl needed).
-      # Runs for ALL projects in the bundle, on the production/primary endpoint (or any
-      # declared postgres_endpoints). Non-fatal per endpoint so one failure won't abort.
-      - name: Set autoscale window + admin grants (post-deploy)
+      # --- POST-deploy: admin grants + data-plane grants -------------------------
+      # NOTE: autoscale is deliberately NOT set here. It is not managed by DABs, and
+      # re-applying it every deploy would clobber a window a group/developer set manually
+      # for a heavy workload. Autoscale is the value stream's own operational knob — set
+      # it out-of-band with `lakebase_prehook.py --phase post --set-autoscale ...`.
+      - name: Grant admin + data-plane access (post-deploy)
         run: |
           # Admin group only. Per-developer UC grants are intentionally NOT wired here
           # (2026-08-05): a developer may not — and often should not — have access to
@@ -189,12 +189,13 @@ jobs:
           # developer-access model. The prehook still accepts --developer (defaults to
           # empty = skip); re-add it here once that model is agreed.
           #
+          # --admin-group: SH_ENTERPRISE_ADMIN gets CAN_MANAGE + catalog ALL_PRIVILEGES +
+          # databricks_superuser (+ createdb/createrole/bypassrls) across all projects.
           # --grant-data-access: derive Postgres data-plane grants from each project's
           # permissions: block and run setup_data_role per (principal x database) —
           # SERVICE_PRINCIPAL -> read+write, USER/GROUP -> read-only. The deployer/owner
           # (this SP) is auto-skipped (already databricks_superuser). Idempotent.
           python3 scripts/lakebase_prehook.py --phase post --target "${{ inputs.target }}" \
-            --min-cu 0.5 --max-cu 2.0 --suspend-timeout 300s \
             --admin-group SH_ENTERPRISE_ADMIN --grant-data-access --profile gh-actions
 
       # NOTE: admin-group databricks_superuser (Postgres data-plane) is now granted by the
@@ -222,4 +223,4 @@ jobs:
             ONLY_ARG="--only ${{ inputs.data_api_project_id }}"
           fi
           python3 scripts/lakebase_prehook.py --phase post --target "${{ inputs.target }}" \
-            --grant-dataapi --admin-group '' --suspend-timeout '' $ONLY_ARG --profile gh-actions
+            --grant-dataapi --admin-group '' $ONLY_ARG --profile gh-actions

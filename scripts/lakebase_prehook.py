@@ -626,12 +626,19 @@ def main() -> int:
     parser.add_argument("--phase", choices=["pre", "post"], default="pre",
                         help="pre  = create-legacy + bind (run BEFORE `bundle deploy`); "
                              "post = set the autoscale CU window (run AFTER `bundle deploy`). Default: pre.")
-    parser.add_argument("--min-cu", type=float, default=0.5, help="Autoscale min CU for --phase post (default 0.5).")
-    parser.add_argument("--max-cu", type=float, default=2.0, help="Autoscale max CU for --phase post (default 2.0).")
+    parser.add_argument("--set-autoscale", action="store_true",
+                        help="(--phase post) OPT-IN: set the endpoint autoscale window + scale-to-zero. "
+                             "OFF by default and intentionally NOT run in CI/CD — autoscale is NOT managed "
+                             "by DABs, and re-applying it on every deploy would CLOBBER a window a group/"
+                             "developer set manually (e.g. bumping CU for a heavy workload). Autoscale is "
+                             "the value stream's own operational knob; run this manually only when you "
+                             "explicitly want to (re)set it.")
+    parser.add_argument("--min-cu", type=float, default=0.5, help="Autoscale min CU (only with --set-autoscale; default 0.5).")
+    parser.add_argument("--max-cu", type=float, default=2.0, help="Autoscale max CU (only with --set-autoscale; default 2.0).")
     parser.add_argument("--suspend-timeout", default="300s",
-                        help="Scale-to-zero idle timeout for --phase post, e.g. '300s' (5m), '3600s' (1h), "
-                             "'604800s' (7d max). Enables scale-to-zero (NOT on by default here). "
-                             "Pass '' to leave the endpoint's current suspend setting untouched. Default 300s.")
+                        help="Scale-to-zero idle timeout (only with --set-autoscale), e.g. '300s' (5m), "
+                             "'3600s' (1h), '604800s' (7d max). Pass '' to leave the endpoint's current "
+                             "suspend setting untouched. Default 300s.")
     parser.add_argument("--admin-group", default="SH_ENTERPRISE_ADMIN",
                         help="Account GROUP granted CAN_MANAGE on each Lakebase project and "
                              "ALL_PRIVILEGES + MANAGE on each UC catalog (--phase post; owner NOT "
@@ -687,14 +694,18 @@ def main() -> int:
         owner = current_identity(args.cli, args.profile) if (args.grant_data_access or args.grant_dataapi) else ""
         for item in items:
             project_id = item["project_id"]
-            # Set the window on each declared endpoint; if none declared, default to
-            # the production branch's primary (the endpoint the legacy create makes).
-            targets = item["endpoints"] or [(None, "production", "primary")]
-            for _ekey, bid, eid in targets:
-                set_autoscale_window(
-                    args.cli, project_id, bid, eid, args.min_cu, args.max_cu, args.profile,
-                    suspend_timeout=(args.suspend_timeout or None), dry_run=args.dry_run,
-                )
+            # Autoscale is OPT-IN (--set-autoscale) and NOT run in CI/CD. It is not managed
+            # by DABs, so re-applying it on every deploy would clobber a window a group/
+            # developer set manually. Set it only when explicitly asked.
+            if args.set_autoscale:
+                # Set the window on each declared endpoint; if none declared, default to
+                # the production branch's primary (the endpoint the legacy create makes).
+                targets = item["endpoints"] or [(None, "production", "primary")]
+                for _ekey, bid, eid in targets:
+                    set_autoscale_window(
+                        args.cli, project_id, bid, eid, args.min_cu, args.max_cu, args.profile,
+                        suspend_timeout=(args.suspend_timeout or None), dry_run=args.dry_run,
+                    )
             # Admin group: CAN_MANAGE on the Lakebase project (closest to 'owner' — no
             # owner concept there), and ALL_PRIVILEGES + MANAGE on each of the project's
             # UC catalogs WITHOUT transferring ownership (SP/creator stays owner).
@@ -762,7 +773,12 @@ def main() -> int:
                 + ". Data-plane grants are required — fix the cause and re-run --phase post "
                   "--grant-data-access."
             )
-        log("Post-hook complete (autoscale + scale-to-zero + admin grants set).")
+        _did = []
+        if args.set_autoscale: _did.append("autoscale")
+        if args.admin_group: _did.append("admin grants")
+        if args.grant_data_access: _did.append("data-plane grants")
+        if args.grant_dataapi: _did.append("data-api wiring")
+        log(f"Post-hook complete ({', '.join(_did) if _did else 'nothing requested'}).")
         return 0
 
     # ---------------- PHASE: pre (create-legacy + bind, BEFORE deploy) ----------
