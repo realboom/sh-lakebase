@@ -195,8 +195,11 @@ jobs:
           # permissions: block and run setup_data_role per (principal x database) —
           # SERVICE_PRINCIPAL -> read+write, USER/GROUP -> read-only. The deployer/owner
           # (this SP) is auto-skipped (already databricks_superuser). Idempotent.
+          # --isolate-catalogs: pin each project's UC catalog to THIS target's workspace
+          # (bind + ISOLATED). dev + prod share a metastore, so without this each env's
+          # catalog is OPEN and reachable from the other environment. Idempotent.
           python3 scripts/lakebase_prehook.py --phase post --target "${{ inputs.target }}" \
-            --admin-group SH_ENTERPRISE_ADMIN --grant-data-access --profile gh-actions
+            --admin-group SH_ENTERPRISE_ADMIN --grant-data-access --isolate-catalogs --profile gh-actions
 
       # NOTE: admin-group databricks_superuser (Postgres data-plane) is now granted by the
       # post-deploy step above (prehook --admin-group -> grant_admin_superuser, via the

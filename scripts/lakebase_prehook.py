@@ -381,6 +381,42 @@ def grant_catalog_read(cli: str, catalog_id: str, principal: str, profile: str |
         log(f"Granted USE_CATALOG + SELECT on catalog '{catalog_id}' to '{principal}'.")
 
 
+def isolate_catalog_to_workspace(cli: str, catalog_id: str, workspace_id: str, profile: str | None, dry_run: bool = False) -> None:
+    """
+    Restrict a UC catalog to ONE workspace: bind the target workspace, then flip the
+    catalog's isolation to ISOLATED. A catalog defaults to OPEN — accessible from EVERY
+    workspace on the metastore. dev + prod share a metastore here, so an OPEN dev catalog
+    is reachable from the prod workspace and vice-versa; ISOLATED + a single binding pins
+    each env's catalog to just its own workspace.
+    Order matters: bind FIRST, then isolate — so the (deploying) workspace is never left
+    without access during the switch. If the bind fails we skip the isolate to avoid
+    orphaning the catalog (ISOLATED with no bindings = reachable from nowhere).
+    Catalog must exist (created by `bundle deploy`, which runs before this post phase).
+    """
+    bind = {"add": [{"workspace_id": int(workspace_id), "binding_type": "BINDING_TYPE_READ_WRITE"}]}
+    bind_cmd = [cli, "workspace-bindings", "update-bindings", "catalog", catalog_id, "--json", json.dumps(bind)]
+    iso_cmd = [cli, "catalogs", "update", catalog_id, "--isolation-mode", "ISOLATED"]
+    if profile:
+        bind_cmd += ["-p", profile]
+        iso_cmd += ["-p", profile]
+    if dry_run:
+        log(f"DRY-RUN would bind catalog '{catalog_id}' to workspace {workspace_id} (READ_WRITE), then set isolation ISOLATED.")
+        return
+    proc = run(bind_cmd, check=False, capture=True)
+    print(proc.stdout, end="")
+    if proc.returncode != 0:
+        log(f"WARNING: could not bind catalog '{catalog_id}' to workspace {workspace_id} "
+            f"(exit {proc.returncode}); leaving isolation unchanged to avoid orphaning it.")
+        return
+    proc = run(iso_cmd, check=False, capture=True)
+    print(proc.stdout, end="")
+    if proc.returncode != 0:
+        log(f"WARNING: bound workspace {workspace_id} but could not set catalog '{catalog_id}' "
+            f"to ISOLATED (exit {proc.returncode}). Set it manually or re-run --phase post.")
+    else:
+        log(f"Isolated catalog '{catalog_id}' to workspace {workspace_id} only (READ_WRITE binding).")
+
+
 # Data-plane privilege policy: what each identity TYPE gets on the Postgres tables.
 #   SERVICE_PRINCIPAL = runtime writer -> read+write
 #   USER / GROUP      = human inspector -> read-only
@@ -660,6 +696,11 @@ def main() -> int:
                              "via setup_dataapi_role. PREREQ: 'Enable Data API' clicked on the "
                              "instance first. Combine with --only <project_id> to do just ONE "
                              "project (the normal path — Enable-Data-API is manual per-instance).")
+    parser.add_argument("--isolate-catalogs", action="store_true",
+                        help="(--phase post) Pin each project's UC catalog(s) to the CURRENT target's "
+                             "workspace: bind that workspace then set isolation ISOLATED. Without this a "
+                             "catalog is OPEN (usable from every workspace on the metastore); since dev + "
+                             "prod share a metastore, that leaks each env's catalog cross-environment.")
     parser.add_argument("--dry-run", action="store_true",
                         help="Discover + print the planned actions per project, but do NOT create, bind, "
                              "or update anything. Safe to run first.")
@@ -677,6 +718,20 @@ def main() -> int:
 
     config = load_bundle_config(args.cli, args.target, args.profile)
     items = extract_projects(config)
+
+    # Workspace id for catalog isolation — derived from the resolved target host
+    # (adb-<workspace-id>.NN.azuredatabricks.net). Only needed for --isolate-catalogs.
+    workspace_id = ""
+    if args.isolate_catalogs:
+        host = config.get("workspace", {}).get("host", "")
+        m = re.search(r"adb-(\d+)\.", host)
+        if not m:
+            raise SystemExit(
+                f"--isolate-catalogs needs the target workspace id, but could not derive it "
+                f"from workspace.host '{host}'. Expected an adb-<id>.NN.azuredatabricks.net host."
+            )
+        workspace_id = m.group(1)
+        log(f"Catalog isolation target: workspace {workspace_id} (from {host}).")
 
     if args.only:
         items = [it for it in items if args.only in (it["project_id"], it["proj_key"])]
@@ -722,6 +777,12 @@ def main() -> int:
                                            args.profile, args.dry_run)
                 if not ok:
                     data_grant_failures.append(f"superuser: {args.admin_group} on {project_id}")
+            # Catalog isolation (opt-in): pin each of the project's UC catalogs to the
+            # CURRENT target's workspace only. Independent of who is granted ON the catalog
+            # (above) — this controls WHICH workspaces can see/use it at all.
+            if args.isolate_catalogs:
+                for _ckey, cat_id in item["catalogs"]:
+                    isolate_catalog_to_workspace(args.cli, cat_id, workspace_id, args.profile, args.dry_run)
             # Developer (dev only — workflow passes --developer only when target=dev):
             # read + view tables on each catalog. Postgres data access for devs comes from
             # the permissions block via --grant-data-access, not here.

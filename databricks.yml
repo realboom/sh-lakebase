@@ -21,6 +21,9 @@ bundle:
 
 include:
   - resources/*.yml
+  # Also pick up value-stream subfolders (e.g. resources/finance/lakebase_risk.yml).
+  # DABs include globs are NOT recursive, so each nesting level needs its own pattern.
+  - resources/*/*.yml
 
 variables:
   # NOTE: per-instance identity (project_id/slug, display_name, catalog stem) is
